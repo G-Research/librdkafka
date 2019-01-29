@@ -39,6 +39,18 @@ void rd_kafka_yield (rd_kafka_t *rk) {
 
 
 /**
+ * @brief Check and reset yield flag.
+ * @returns rd_true if caller should yield, otherwise rd_false.
+ * @remarks rkq_lock MUST be held
+ */
+static RD_INLINE rd_bool_t rd_kafka_q_check_yield (rd_kafka_q_t *rkq) {
+        if (!(rkq->rkq_flags & RD_KAFKA_Q_F_YIELD))
+                return rd_false;
+
+        rkq->rkq_flags &= ~RD_KAFKA_Q_F_YIELD;
+        return rd_true;
+}
+/**
  * Destroy a queue. refcnt must be at zero.
  */
 void rd_kafka_q_destroy_final (rd_kafka_q_t *rkq) {
@@ -69,7 +81,8 @@ void rd_kafka_q_destroy_final (rd_kafka_q_t *rkq) {
 /**
  * Initialize a queue.
  */
-void rd_kafka_q_init (rd_kafka_q_t *rkq, rd_kafka_t *rk) {
+void rd_kafka_q_init0 (rd_kafka_q_t *rkq, rd_kafka_t *rk,
+                       const char *func, int line) {
         rd_kafka_q_reset(rkq);
 	rkq->rkq_fwdq   = NULL;
         rkq->rkq_refcnt = 1;
@@ -80,6 +93,11 @@ void rd_kafka_q_init (rd_kafka_q_t *rkq, rd_kafka_t *rk) {
         rkq->rkq_opaque = NULL;
 	mtx_init(&rkq->rkq_lock, mtx_plain);
 	cnd_init(&rkq->rkq_cond);
+#if ENABLE_DEVEL
+        rd_snprintf(rkq->rkq_name, sizeof(rkq->rkq_name), "%s:%d", func, line);
+#else
+        rkq->rkq_name = func;
+#endif
 }
 
 
@@ -325,16 +343,16 @@ rd_kafka_op_t *rd_kafka_q_pop_serve (rd_kafka_q_t *rkq, int timeout_ms,
 
         rd_dassert(cb_type);
 
-	if (timeout_ms == RD_POLL_INFINITE)
-		timeout_ms = INT_MAX;
-
 	mtx_lock(&rkq->rkq_lock);
 
         rd_kafka_yield_thread = 0;
         if (!(fwdq = rd_kafka_q_fwd_get(rkq, 0))) {
-                do {
+                struct timespec timeout_tspec;
+
+                rd_timeout_init_timespec(&timeout_tspec, timeout_ms);
+
+                while (1) {
                         rd_kafka_op_res_t res;
-                        rd_ts_t pre;
 
                         /* Filter out outdated ops */
                 retry:
@@ -352,7 +370,8 @@ rd_kafka_op_t *rd_kafka_q_pop_serve (rd_kafka_q_t *rkq, int timeout_ms,
                                 res = rd_kafka_op_handle(rkq->rkq_rk, rkq, rko,
                                                          cb_type, opaque,
                                                          callback);
-                                if (res == RD_KAFKA_OP_RES_HANDLED)
+                                if (res == RD_KAFKA_OP_RES_HANDLED ||
+                                    res == RD_KAFKA_OP_RES_KEEP)
                                         goto retry; /* Next op */
                                 else if (unlikely(res ==
                                                   RD_KAFKA_OP_RES_YIELD)) {
@@ -363,24 +382,19 @@ rd_kafka_op_t *rd_kafka_q_pop_serve (rd_kafka_q_t *rkq, int timeout_ms,
                                         break; /* Proper op, handle below. */
                         }
 
-                        /* No op, wait for one if we have time left */
-                        if (timeout_ms == RD_POLL_NOWAIT)
-                                break;
+                        if (unlikely(rd_kafka_q_check_yield(rkq))) {
+                                mtx_unlock(&rkq->rkq_lock);
+                                return NULL;
+                        }
 
-			pre = rd_clock();
-			if (cnd_timedwait_ms(&rkq->rkq_cond,
-					     &rkq->rkq_lock,
-					     timeout_ms) ==
-			    thrd_timedout) {
+                        if (cnd_timedwait_abs(&rkq->rkq_cond,
+                                              &rkq->rkq_lock,
+                                              &timeout_tspec) ==
+                            thrd_timedout) {
 				mtx_unlock(&rkq->rkq_lock);
 				return NULL;
 			}
-			/* Remove spent time */
-			timeout_ms -= (int) (rd_clock()-pre) / 1000;
-			if (timeout_ms < 0)
-				timeout_ms = RD_POLL_NOWAIT;
-
-		} while (timeout_ms != RD_POLL_NOWAIT);
+                }
 
                 mtx_unlock(&rkq->rkq_lock);
 
@@ -422,6 +436,7 @@ int rd_kafka_q_serve (rd_kafka_q_t *rkq, int timeout_ms,
 	rd_kafka_q_t localq;
         rd_kafka_q_t *fwdq;
         int cnt = 0;
+        struct timespec timeout_tspec;
 
         rd_dassert(cb_type);
 
@@ -439,18 +454,14 @@ int rd_kafka_q_serve (rd_kafka_q_t *rkq, int timeout_ms,
 		return ret;
 	}
 
-	if (timeout_ms == RD_POLL_INFINITE)
-		timeout_ms = INT_MAX;
+        rd_timeout_init_timespec(&timeout_tspec, timeout_ms);
 
-	/* Wait for op */
-	while (!(rko = TAILQ_FIRST(&rkq->rkq_q)) && timeout_ms != 0) {
-		if (cnd_timedwait_ms(&rkq->rkq_cond,
-				     &rkq->rkq_lock,
-				     timeout_ms) != thrd_success)
-			break;
-
-		timeout_ms = 0;
-	}
+        /* Wait for op */
+        while (!(rko = TAILQ_FIRST(&rkq->rkq_q)) &&
+               !rd_kafka_q_check_yield(rkq) &&
+               cnd_timedwait_abs(&rkq->rkq_cond, &rkq->rkq_lock,
+                                 &timeout_tspec) == thrd_success)
+                ;
 
 	if (!rko) {
 		mtx_unlock(&rkq->rkq_lock);
@@ -513,6 +524,9 @@ int rd_kafka_q_serve_rkmessages (rd_kafka_q_t *rkq, int timeout_ms,
         rd_kafka_op_t *rko, *next;
         rd_kafka_t *rk = rkq->rkq_rk;
         rd_kafka_q_t *fwdq;
+        struct timespec timeout_tspec;
+
+        rd_kafka_app_polled(rk);
 
 	mtx_lock(&rkq->rkq_lock);
         if ((fwdq = rd_kafka_q_fwd_get(rkq, 0))) {
@@ -526,17 +540,19 @@ int rd_kafka_q_serve_rkmessages (rd_kafka_q_t *rkq, int timeout_ms,
 	}
         mtx_unlock(&rkq->rkq_lock);
 
+        rd_timeout_init_timespec(&timeout_tspec, timeout_ms);
+
         rd_kafka_yield_thread = 0;
 	while (cnt < rkmessages_size) {
                 rd_kafka_op_res_t res;
 
                 mtx_lock(&rkq->rkq_lock);
 
-		while (!(rko = TAILQ_FIRST(&rkq->rkq_q))) {
-			if (cnd_timedwait_ms(&rkq->rkq_cond, &rkq->rkq_lock,
-                                             timeout_ms) == thrd_timedout)
-				break;
-		}
+                while (!(rko = TAILQ_FIRST(&rkq->rkq_q)) &&
+                       !rd_kafka_q_check_yield(rkq) &&
+                       cnd_timedwait_abs(&rkq->rkq_cond, &rkq->rkq_lock,
+                                         &timeout_tspec) != thrd_timedout)
+                        ;
 
 		if (!rko) {
                         mtx_unlock(&rkq->rkq_lock);
@@ -556,8 +572,9 @@ int rd_kafka_q_serve_rkmessages (rd_kafka_q_t *rkq, int timeout_ms,
                 /* Serve non-FETCH callbacks */
                 res = rd_kafka_poll_cb(rk, rkq, rko,
                                        RD_KAFKA_Q_CB_RETURN, NULL);
-                if (res == RD_KAFKA_OP_RES_HANDLED) {
-                        /* Callback served, rko is destroyed. */
+                if (res == RD_KAFKA_OP_RES_KEEP ||
+                    res == RD_KAFKA_OP_RES_HANDLED) {
+                        /* Callback served, rko is destroyed (if HANDLED). */
                         continue;
                 } else if (unlikely(res == RD_KAFKA_OP_RES_YIELD ||
                                     rd_kafka_yield_thread)) {
@@ -599,7 +616,10 @@ int rd_kafka_q_serve_rkmessages (rd_kafka_q_t *rkq, int timeout_ms,
 
 
 void rd_kafka_queue_destroy (rd_kafka_queue_t *rkqu) {
-        rd_kafka_q_destroy_owner(rkqu->rkqu_q);
+        if (rkqu->rkqu_is_owner)
+                rd_kafka_q_destroy_owner(rkqu->rkqu_q);
+        else
+                rd_kafka_q_destroy(rkqu->rkqu_q);
         rd_free(rkqu);
 }
 
@@ -625,6 +645,7 @@ rd_kafka_queue_t *rd_kafka_queue_new (rd_kafka_t *rk) {
 	rkqu = rd_kafka_queue_new0(rk, rkq);
 	rd_kafka_q_destroy(rkq); /* Loose refcount from q_new, one is held
 				  * by queue_new0 */
+        rkqu->rkqu_is_owner = 1;
 	return rkqu;
 }
 
@@ -665,6 +686,14 @@ rd_kafka_queue_t *rd_kafka_queue_get_partition (rd_kafka_t *rk,
         return result;
 }
 
+rd_kafka_queue_t *rd_kafka_queue_get_background (rd_kafka_t *rk) {
+        if (rk->rk_background.q)
+                return rd_kafka_queue_new0(rk, rk->rk_background.q);
+        else
+                return NULL;
+}
+
+
 rd_kafka_resp_err_t rd_kafka_set_log_queue (rd_kafka_t *rk,
                                             rd_kafka_queue_t *rkqu) {
         rd_kafka_q_t *rkq;
@@ -699,6 +728,8 @@ void rd_kafka_q_io_event_enable (rd_kafka_q_t *rkq, int fd,
                 qio->fd = fd;
                 qio->size = size;
                 qio->payload = (void *)(qio+1);
+                qio->event_cb = NULL;
+                qio->event_cb_opaque = NULL;
                 memcpy(qio->payload, payload, size);
         }
 
@@ -719,6 +750,46 @@ void rd_kafka_q_io_event_enable (rd_kafka_q_t *rkq, int fd,
 void rd_kafka_queue_io_event_enable (rd_kafka_queue_t *rkqu, int fd,
                                      const void *payload, size_t size) {
         rd_kafka_q_io_event_enable(rkqu->rkqu_q, fd, payload, size);
+}
+
+
+/**
+ * @brief Enable or disable(event_cb==NULL) callback-based wake-ups for queue
+ */
+void rd_kafka_q_cb_event_enable (rd_kafka_q_t *rkq,
+                                 void (*event_cb) (rd_kafka_t *rk,
+                                                   void *opaque),
+                                 void *opaque) {
+        struct rd_kafka_q_io *qio = NULL;
+
+        if (event_cb) {
+                qio = rd_malloc(sizeof(*qio));
+                qio->fd = -1;
+                qio->size = 0;
+                qio->payload = NULL;
+                qio->event_cb = event_cb;
+                qio->event_cb_opaque = opaque;
+        }
+
+        mtx_lock(&rkq->rkq_lock);
+        if (rkq->rkq_qio) {
+                rd_free(rkq->rkq_qio);
+                rkq->rkq_qio = NULL;
+        }
+
+        if (event_cb) {
+                rkq->rkq_qio = qio;
+        }
+
+        mtx_unlock(&rkq->rkq_lock);
+
+}
+
+void rd_kafka_queue_cb_event_enable (rd_kafka_queue_t *rkqu,
+                                     void (*event_cb) (rd_kafka_t *rk,
+                                                       void *opaque),
+                                     void *opaque) {
+        rd_kafka_q_cb_event_enable (rkqu->rkqu_q, event_cb, opaque);
 }
 
 
@@ -863,4 +934,11 @@ void rd_kafka_q_dump (FILE *fp, rd_kafka_q_t *rkq) {
         }
 
         mtx_unlock(&rkq->rkq_lock);
+}
+
+
+void rd_kafka_enq_once_trigger_destroy (void *ptr) {
+        rd_kafka_enq_once_t *eonce = ptr;
+
+        rd_kafka_enq_once_trigger(eonce, RD_KAFKA_RESP_ERR__DESTROY, "destroy");
 }

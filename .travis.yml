@@ -10,10 +10,10 @@ os:
 - osx
 dist: trusty
 sudo: false
-before_install:
-  - if [[ "${TRAVIS_OS_NAME}_$CC" == "linux_gcc" ]]; then sudo make -C packaging/rpm MOCK_CONFIG=el7-x86_64 prepare_ubuntu ; fi
 before_script:
  - ccache -s || echo "CCache is not available."
+ - if [[ $TRAVIS_OS_NAME == linux ]]; then sudo apt-get install -y libzstd-dev  || true ; fi
+ - if [[ $TRAVIS_OS_NAME == osx ]]; then brew install zstd ; fi
 script:
 - rm -rf artifacts dest
 - mkdir dest artifacts
@@ -22,14 +22,15 @@ script:
 - make -j2 all examples check && make -C tests run_local
 - make install
 - (cd dest && tar cvzf ../artifacts/librdkafka.tar.gz .)
-- if [[ "${TRAVIS_OS_NAME}_$CC" == "linux_gcc" ]]; then sudo make -C packaging/rpm MOCK_CONFIG=el7-x86_64 all copy-artifacts ; fi
+- if [[ "${TRAVIS_OS_NAME}_$CC" == "linux_gcc" ]]; then packaging/rpm/mock-on-docker.sh ; fi
 - if [[ "${TRAVIS_OS_NAME}_$CC" == "linux_gcc" ]]; then docker run -it -v $PWD:/v microsoft/dotnet:2-sdk /v/packaging/tools/build-debian.sh /v /v/artifacts/librdkafka-debian9.tgz; fi
+- if [[ "${TRAVIS_OS_NAME}_$CC" == "linux_clang" ]]; then packaging/alpine/test-build.sh ; fi
 deploy:
   provider: s3
   access_key_id:
-    secure: "i7IAO5z6xYeVaOnFiJOz0wluH7CfGf39TiABQG/yQIIp53fRu+X94FBUS7xq2PziKV08ak8pNWWjenwRB/viPTGqFQDS/ypymhSGGQVTmhgG372ypODhqbnvzskMNe1wp+UFIl8LFVEaHMVPEwWVuYpXhWNMHGrr4uSQhF+5r0Y="
+    secure: "m8FQrFesK0xSS1wHo2S7cuWkpO7VB91dBmj1XIYLRXZSkbMpKBJATcFcHNbrAp3slEp7wLAnT7CHrQ4ccQi4H68Z7mjEwdq4VKRE+7zqJ/feK8MOFNeSHWLQzgwLUYlRlc9+tzLNwxMuL2ilWgdjKOArsUVHo9LEKNfQ3T6zCJU="
   secret_access_key:
-    secure: q7rWZkwQqyIFu3i32y/rJsKF1AJpwIqQe3AhBFEqjCz80mdEYysvcHBfl956EAAr4qbR3umIKbkhRwbBVyDGlMaraZiR7YFgAO+v0DRFeMiF5XFE3KHNIpCQHSKnzOiL65TpJHZIoB+6w0lAbBVzj87MBN0axAeArHKiO1y8Eec=
+    secure: "GE6O0gk5VRervntCKAmczfBdSOvbr9bouJ15H2rpcOgHi8KTDEjI/NS69eLiRRSHBCARtcRqN4wfgy+/dn7D1VklY8a1rAKu02wGjw+fq7k7GVSSmynR/aF619R4SIABsaAhNCwswXnLHuLlq8HFk5ulG3z8DUvYBczB45bWZfQ="
   bucket: librdkafka-ci-packages
   region: us-west-1
   skip_cleanup: true

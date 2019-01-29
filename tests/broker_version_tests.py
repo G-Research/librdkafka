@@ -46,16 +46,14 @@ def test_it (version, deploy=True, conf={}, rdkconf={}, tests=None,
     cluster.start(timeout=30)
 
     if conf.get('test_mode', '') == 'bash':
-        cmd_env = 'export KAFKA_PATH="%s" RDKAFKA_TEST_CONF="%s" ZK_ADDRESS="%s" BROKERS="%s" TEST_KAFKA_VERSION="%s" TRIVUP_ROOT="%s"; ' % \
-                  (cluster.get_all('destdir', '', KafkaBrokerApp)[0], rdkafka.test_conf_file, cluster.get_all('address', '', ZookeeperApp)[0], cluster.bootstrap_servers(), version, cluster.instance_path())
         cmd = 'bash --rcfile <(cat ~/.bashrc; echo \'PS1="[TRIVUP:%s@%s] \\u@\\h:\w$ "\')' % (cluster.name, version)
-        subprocess.call('%s %s' % (cmd_env, cmd), shell=True, executable='/bin/bash')
+        subprocess.call(cmd, env=rdkafka.env, shell=True, executable='/bin/bash')
         report = None
 
     else:
         rdkafka.start()
         print('# librdkafka regression tests started, logs in %s' % rdkafka.root_path())
-        rdkafka.wait_stopped(timeout=60*10)
+        rdkafka.wait_stopped(timeout=60*30)
 
         report = rdkafka.report()
         report['root_path'] = rdkafka.root_path()
@@ -63,7 +61,7 @@ def test_it (version, deploy=True, conf={}, rdkconf={}, tests=None,
         if report.get('tests_failed', 0) > 0 and interact:
             print('# Connect to cluster with bootstrap.servers %s' % cluster.bootstrap_servers())
             print('# Exiting the shell will bring down the cluster. Good luck.')
-            subprocess.call('bash --rcfile <(cat ~/.bashrc; echo \'PS1="[TRIVUP:%s@%s] \\u@\\h:\w$ "\')' % (cluster.name, version), shell=True, executable='/bin/bash')
+            subprocess.call('bash --rcfile <(cat ~/.bashrc; echo \'PS1="[TRIVUP:%s@%s] \\u@\\h:\w$ "\')' % (cluster.name, version), env=rdkafka.env, shell=True, executable='/bin/bash')
 
     cluster.stop(force=True)
 
@@ -201,6 +199,10 @@ if __name__ == '__main__':
                 print('\033[41m#### Version %s, suite %s: FAILED: %s\033[0m' %
                       (version, suite['name'], reason))
                 fail_cnt += 1
+
+                # Emit hopefully relevant parts of the log on failure
+                subprocess.call("grep --color=always -B100 -A10 FAIL %s" % (os.path.join(report['root_path'], 'stderr.log')), shell=True)
+
             print('#### Test output: %s/stderr.log' % (report['root_path']))
 
             suite['version'][version] = report

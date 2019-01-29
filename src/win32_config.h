@@ -29,12 +29,18 @@
 /**
  * Hand-crafted config header file for Win32 builds.
  */
-#pragma once
+#ifndef _RD_WIN32_CONFIG_H_
+#define _RD_WIN32_CONFIG_H_
 
+#ifndef WITHOUT_WIN32_CONFIG
 #define WITH_SSL 1
 #define WITH_ZLIB 1
 #define WITH_SNAPPY 1
 #define WITH_SASL_SCRAM 1
 #define ENABLE_DEVEL 0
 #define WITH_PLUGINS 1
+#define WITH_HDRHISTOGRAM 1
+#endif
 #define SOLIB_EXT ".dll"
+
+#endif /* _RD_WIN32_CONFIG_H_ */

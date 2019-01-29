@@ -32,6 +32,7 @@
 #include "rdkafka_topic.h"
 #include "rdkafka_broker.h"
 #include "rdkafka_request.h"
+#include "rdkafka_idempotence.h"
 #include "rdkafka_metadata.h"
 
 #include <string.h>
@@ -51,7 +52,8 @@ rd_kafka_metadata (rd_kafka_t *rk, int all_topics,
 
         /* Query any broker that is up, and if none are up pick the first one,
          * if we're lucky it will be up before the timeout */
-	rkb = rd_kafka_broker_any_usable(rk, timeout_ms, 1);
+        rkb = rd_kafka_broker_any_usable(rk, timeout_ms, 1,
+                                         "application metadata request");
 	if (!rkb)
 		return RD_KAFKA_RESP_ERR__TRANSPORT;
 
@@ -195,20 +197,23 @@ rd_kafka_metadata_copy (const struct rd_kafka_metadata *src, size_t size) {
 
 
 /**
- * Handle a Metadata response message.
+ * @brief Handle a Metadata response message.
  *
  * @param topics are the requested topics (may be NULL)
  *
  * The metadata will be marshalled into 'struct rd_kafka_metadata*' structs.
  *
- * Returns the marshalled metadata, or NULL on parse error.
+ * The marshalled metadata is returned in \p *mdp, (NULL on error).
+
+ * @returns an error code on parse failure, else NO_ERRRO.
  *
  * @locality rdkafka main thread
  */
-struct rd_kafka_metadata *
+rd_kafka_resp_err_t
 rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
                          rd_kafka_buf_t *request,
-                         rd_kafka_buf_t *rkbuf) {
+                         rd_kafka_buf_t *rkbuf,
+                         struct rd_kafka_metadata **mdp) {
         rd_kafka_t *rk = rkb->rkb_rk;
         int i, j, k;
         rd_tmpabuf_t tbuf;
@@ -223,6 +228,8 @@ rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
         int ApiVersion = request->rkbuf_reqhdr.ApiVersion;
         rd_kafkap_str_t cluster_id = RD_ZERO_INIT;
         int32_t controller_id = -1;
+        rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
+        int broadcast_changes = 0;
 
         rd_kafka_assert(NULL, thrd_is_current(rk->rk_thread));
 
@@ -239,8 +246,11 @@ rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
                        sizeof(*md) + rkb_namelen + (rkbuf->rkbuf_totlen * 4),
                        0/*dont assert on fail*/);
 
-        if (!(md = rd_tmpabuf_alloc(&tbuf, sizeof(*md))))
+        if (!(md = rd_tmpabuf_alloc(&tbuf, sizeof(*md)))) {
+                err = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
                 goto err;
+        }
+
         md->orig_broker_id = rkb->rkb_nodeid;
         md->orig_broker_name = rd_tmpabuf_write(&tbuf,
                                                 rkb->rkb_name, rkb_namelen);
@@ -401,18 +411,27 @@ rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
                                                        partitions[j].isrs[k]);
 
                 }
+
+                /* Sort partitions by partition id */
+                qsort(md->topics[i].partitions,
+                      md->topics[i].partition_cnt,
+                      sizeof(*md->topics[i].partitions),
+                      rd_kafka_metadata_partition_id_cmp);
         }
 
         /* Entire Metadata response now parsed without errors:
          * update our internal state according to the response. */
 
         /* Avoid metadata updates when we're terminating. */
-        if (rd_kafka_terminating(rkb->rkb_rk))
+        if (rd_kafka_terminating(rkb->rkb_rk)) {
+                err = RD_KAFKA_RESP_ERR__DESTROY;
                 goto done;
+        }
 
         if (md->broker_cnt == 0 && md->topic_cnt == 0) {
                 rd_rkb_dbg(rkb, METADATA, "METADATA",
-                           "No brokers or topics in metadata: retrying");
+                           "No brokers or topics in metadata: should retry");
+                err = RD_KAFKA_RESP_ERR__PARTIAL;
                 goto err;
         }
 
@@ -458,7 +477,9 @@ rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
                                    "topic %s (PartCnt %i): %s: ignoring",
                                    mdt->topic, mdt->partition_cnt,
                                    rd_kafka_err2str(mdt->err));
-                        rd_list_free_cb(missing_topics,
+                        if (missing_topics)
+                                rd_list_free_cb(
+                                        missing_topics,
                                         rd_list_remove_cmp(missing_topics,
                                                            mdt->topic,
                                                            (void *)strcmp));
@@ -524,6 +545,15 @@ rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
                 rkb->rkb_rk->rk_clusterid = RD_KAFKAP_STR_DUP(&cluster_id);
         }
 
+        /* Update controller id. */
+        if (rkb->rkb_rk->rk_controllerid != controller_id) {
+                rd_rkb_dbg(rkb, BROKER, "CONTROLLERID",
+                           "ControllerId update %"PRId32" -> %"PRId32,
+                           rkb->rkb_rk->rk_controllerid, controller_id);
+                rkb->rkb_rk->rk_controllerid = controller_id;
+                broadcast_changes++;
+        }
+
         if (all_topics) {
                 rd_kafka_metadata_cache_update(rkb->rkb_rk,
                                                md, 1/*abs update*/);
@@ -547,13 +577,21 @@ rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
 
         rd_kafka_wrunlock(rkb->rkb_rk);
 
+        if (broadcast_changes) {
+                /* Broadcast metadata changes to listeners. */
+                rd_kafka_brokers_broadcast_state_change(rkb->rkb_rk);
+        }
+
         /* Check if cgrp effective subscription is affected by
          * new metadata. */
         if (rkb->rkb_rk->rk_cgrp)
                 rd_kafka_cgrp_metadata_update_check(
                         rkb->rkb_rk->rk_cgrp, 1/*do join*/);
 
-
+        /* Try to acquire a Producer ID from this broker if we
+         * don't have one. */
+        if (rd_kafka_is_idempotent(rkb->rkb_rk))
+                rd_kafka_idemp_request_pid(rkb->rkb_rk, rkb, "metadata update");
 
 done:
         if (missing_topics)
@@ -565,10 +603,13 @@ done:
          * the requestee will do.
          * The tbuf is explicitly not destroyed as we return its memory
          * to the caller. */
-        return md;
+        *mdp = md;
+
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
 
  err_parse:
-err:
+        err = rkbuf->rkbuf_err;
+ err:
         if (requested_topics) {
                 /* Failed requests shall purge cache hints for
                  * the requested topics. */
@@ -581,7 +622,8 @@ err:
                 rd_list_destroy(missing_topics);
 
         rd_tmpabuf_destroy(&tbuf);
-        return NULL;
+
+        return err;
 }
 
 
@@ -740,7 +782,8 @@ rd_kafka_metadata_refresh_topics (rd_kafka_t *rk, rd_kafka_broker_t *rkb,
         rd_kafka_wrlock(rk);
 
         if (!rkb) {
-                if (!(rkb = rd_kafka_broker_any_usable(rk, RD_POLL_NOWAIT, 0))){
+                if (!(rkb = rd_kafka_broker_any_usable(rk, RD_POLL_NOWAIT, 0,
+                                                       reason))) {
                         rd_kafka_wrunlock(rk);
                         rd_kafka_dbg(rk, METADATA, "METADATA",
                                      "Skipping metadata refresh of %d topic(s):"
@@ -872,7 +915,8 @@ rd_kafka_metadata_refresh_all (rd_kafka_t *rk, rd_kafka_broker_t *rkb,
                 rk = rkb->rkb_rk;
 
         if (!rkb) {
-                if (!(rkb = rd_kafka_broker_any_usable(rk, RD_POLL_NOWAIT, 1)))
+                if (!(rkb = rd_kafka_broker_any_usable(rk, RD_POLL_NOWAIT, 1,
+                                                       reason)))
                         return RD_KAFKA_RESP_ERR__TRANSPORT;
                 destroy_rkb = 1;
         }
@@ -903,7 +947,8 @@ rd_kafka_metadata_request (rd_kafka_t *rk, rd_kafka_broker_t *rkb,
         int destroy_rkb = 0;
 
         if (!rkb) {
-                if (!(rkb = rd_kafka_broker_any_usable(rk, RD_POLL_NOWAIT, 1)))
+                if (!(rkb = rd_kafka_broker_any_usable(rk, RD_POLL_NOWAIT, 1,
+                                                       reason)))
                         return RD_KAFKA_RESP_ERR__TRANSPORT;
                 destroy_rkb = 1;
         }

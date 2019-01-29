@@ -52,7 +52,7 @@ static void test_producer_partition_cnt_change (void) {
 	rd_kafka_topic_t *rkt;
 	const char *topic = test_mk_topic_name(__FUNCTION__, 1);
 	const int partition_cnt = 4;
-	int msgcnt = 100000;
+	int msgcnt = test_on_ci ? 5000 : 100000;
 	test_timing_t t_destroy;
 	int produced = 0;
 
@@ -61,7 +61,7 @@ static void test_producer_partition_cnt_change (void) {
 			  topic, partition_cnt/2);
 
 	test_conf_init(&conf, NULL, 20);
-
+        rd_kafka_conf_set_dr_msg_cb(conf, test_dr_msg_cb);
 	rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
 	rkt = test_create_topic_object(rk, __FUNCTION__,
 				       "message.timeout.ms",

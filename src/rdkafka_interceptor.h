@@ -50,7 +50,8 @@ rd_kafka_interceptors_on_acknowledgement (rd_kafka_t *rk,
                                           rd_kafka_message_t *rkmessage);
 void
 rd_kafka_interceptors_on_acknowledgement_queue (rd_kafka_t *rk,
-                                                rd_kafka_msgq_t *rkmq);
+                                                rd_kafka_msgq_t *rkmq,
+                                                rd_kafka_resp_err_t force_err);
 
 void rd_kafka_interceptors_on_consume (rd_kafka_t *rk,
                                        rd_kafka_message_t *rkmessage);
@@ -58,6 +59,15 @@ void
 rd_kafka_interceptors_on_commit (rd_kafka_t *rk,
                                  const rd_kafka_topic_partition_list_t *offsets,
                                  rd_kafka_resp_err_t err);
+
+void rd_kafka_interceptors_on_request_sent (rd_kafka_t *rk,
+                                            int sockfd,
+                                            const char *brokername,
+                                            int32_t brokerid,
+                                            int16_t ApiKey,
+                                            int16_t ApiVersion,
+                                            int32_t CorrId,
+                                            size_t  size);
 
 
 void rd_kafka_conf_interceptor_ctor (int scope, void *pconf);

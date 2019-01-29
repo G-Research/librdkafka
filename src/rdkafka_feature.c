@@ -43,6 +43,8 @@ static const char *rd_kafka_feature_names[] = {
 	"LZ4",
         "OffsetTime",
         "MsgVer2",
+        "IdempotentProducer",
+	"ZSTD",
 	NULL
 };
 
@@ -171,6 +173,23 @@ static const struct rd_kafka_feature_map {
                         { RD_KAFKAP_Offset, 1, 1 },
                         { -1 },
                 }
+        },
+        {
+                /* @brief >=0.11.0.0: Idempotent Producer*/
+                .feature = RD_KAFKA_FEATURE_IDEMPOTENT_PRODUCER,
+                .depends = {
+                        { RD_KAFKAP_InitProducerId, 0, 0 },
+                        { -1 },
+                }
+        },
+        {
+                /* @brief >=2.1.0-IV2: Support ZStandard Compression Codec (KIP-110) */
+                .feature = RD_KAFKA_FEATURE_ZSTD,
+                .depends = {
+                        { RD_KAFKAP_Produce, 7, 7 },
+                        { RD_KAFKAP_Fetch, 10, 10 },
+                        { -1 },
+                },
         },
         { .feature = 0 }, /* sentinel */
 };
@@ -415,7 +434,7 @@ rd_kafka_ApiVersions_copy (const struct rd_kafka_ApiVersion *src,
  * @returns a human-readable feature flag string.
  */
 const char *rd_kafka_features2str (int features) {
-	static RD_TLS char ret[4][128];
+	static RD_TLS char ret[4][256];
 	size_t of = 0;
 	static RD_TLS int reti = 0;
 	int i;

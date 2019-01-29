@@ -25,7 +25,8 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#pragma once
+#ifndef _RDKAFKA_CGRP_H_
+#define _RDKAFKA_CGRP_H_
 
 #include "rdinterval.h"
 
@@ -50,7 +51,6 @@ extern const char *rd_kafka_cgrp_join_state_names[];
  * Client group
  */
 typedef struct rd_kafka_cgrp_s {
-        TAILQ_ENTRY(rd_kafka_cgrp_s) rkcg_rkb_link;  /* rkb_cgrps */
         const rd_kafkap_str_t    *rkcg_group_id;
         rd_kafkap_str_t          *rkcg_member_id;  /* Last assigned MemberId */
         const rd_kafkap_str_t    *rkcg_client_id;
@@ -142,6 +142,23 @@ typedef struct rd_kafka_cgrp_s {
                                                      * send a new one. */
 #define RD_KAFKA_CGRP_F_WILDCARD_SUBSCRIPTION 0x40  /* Subscription contains
                                                      * wildcards. */
+#define RD_KAFKA_CGRP_F_WAIT_LEAVE            0x80  /* Wait for LeaveGroup
+                                                     * to be sent.
+                                                     * This is used to stall
+                                                     * termination until
+                                                     * the LeaveGroupRequest
+                                                     * is responded to,
+                                                     * otherwise it risks
+                                                     * being dropped in the
+                                                     * output queue when
+                                                     * the broker is destroyed.
+                                                     */
+#define RD_KAFKA_CGRP_F_MAX_POLL_EXCEEDED 0x100     /**< max.poll.interval.ms
+                                                     *   was exceeded and we
+                                                     *   left the group.
+                                                     *   Do not rejoin until
+                                                     *   the application has
+                                                     *   polled again. */
 
         rd_interval_t      rkcg_coord_query_intvl;  /* Coordinator query intvl*/
         rd_interval_t      rkcg_heartbeat_intvl;    /* Heartbeat intvl */
@@ -154,24 +171,24 @@ typedef struct rd_kafka_cgrp_s {
 
 	int                rkcg_assigned_cnt;       /* Assigned partitions */
 
-        int32_t            rkcg_coord_id;           /* Current coordinator id */
-
         int32_t            rkcg_generation_id;      /* Current generation id */
 
         rd_kafka_assignor_t *rkcg_assignor;         /* Selected partition
                                                      * assignor strategy. */
 
-        rd_kafka_broker_t *rkcg_rkb;                /* Current handling broker,
-                                                     * if the coordinator broker
-                                                     * is not available this
-                                                     * will be another broker
-                                                     * that will handle the
-                                                     * querying of coordinator
-                                                     * etc.
-                                                     * Broker in this sense
-                                                     * is a broker_t object,
-                                                     * not necessarily a
-                                                     * real broker. */
+        int32_t            rkcg_coord_id;      /**< Current coordinator id,
+                                                *   or -1 if not known. */
+
+        rd_kafka_broker_t *rkcg_curr_coord;    /**< Current coordinator
+                                                *   broker handle, or NULL.
+                                                *   rkcg_coord's nodename is
+                                                *   updated to this broker's
+                                                *   nodename when there is a
+                                                *   coordinator change. */
+        rd_kafka_broker_t *rkcg_coord;         /**< The dedicated coordinator
+                                                *   broker handle.
+                                                *   Will be updated when the
+                                                *   coordinator changes. */
 
         /* Current subscription */
         rd_kafka_topic_partition_list_t *rkcg_subscription;
@@ -197,6 +214,8 @@ typedef struct rd_kafka_cgrp_s {
                                                      * same errors. */
 
         rd_kafka_timer_t   rkcg_offset_commit_tmr;  /* Offset commit timer */
+        rd_kafka_timer_t   rkcg_max_poll_interval_tmr; /**< Enforce the max
+                                                        *   poll interval. */
 
         rd_kafka_t        *rkcg_rk;
 
@@ -214,6 +233,8 @@ typedef struct rd_kafka_cgrp_s {
                                                         * last rebalance */
                 int                rebalance_cnt;      /* Number of
                                                           rebalances */
+                char               rebalance_reason[128]; /**< Last rebalance
+                                                           *   reason */
                 int                assignment_size;    /* Partition count
                                                         * of last rebalance
                                                         * assignment */
@@ -233,6 +254,7 @@ typedef struct rd_kafka_cgrp_s {
          (rkcg)->rkcg_coord_id == (rkb)->rkb_nodeid)
 
 extern const char *rd_kafka_cgrp_state_names[];
+extern const char *rd_kafka_cgrp_join_state_names[];
 
 void rd_kafka_cgrp_destroy_final (rd_kafka_cgrp_t *rkcg);
 rd_kafka_cgrp_t *rd_kafka_cgrp_new (rd_kafka_t *rk,
@@ -265,11 +287,11 @@ void rd_kafka_cgrp_handle_SyncGroup (rd_kafka_cgrp_t *rkcg,
                                      const rd_kafkap_bytes_t *member_state);
 void rd_kafka_cgrp_set_join_state (rd_kafka_cgrp_t *rkcg, int join_state);
 
-int rd_kafka_cgrp_reassign_broker (rd_kafka_cgrp_t *rkcg);
-
 void rd_kafka_cgrp_coord_query (rd_kafka_cgrp_t *rkcg,
 				const char *reason);
 void rd_kafka_cgrp_coord_dead (rd_kafka_cgrp_t *rkcg, rd_kafka_resp_err_t err,
 			       const char *reason);
 void rd_kafka_cgrp_metadata_update_check (rd_kafka_cgrp_t *rkcg, int do_join);
 #define rd_kafka_cgrp_get(rk) ((rk)->rk_cgrp)
+
+#endif /* _RDKAFKA_CGRP_H_ */

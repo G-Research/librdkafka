@@ -98,12 +98,15 @@
     <ClInclude Include="..\src\rdavg.h" />
     <ClInclude Include="..\src\rdbuf.h" />
     <ClInclude Include="..\src\rdendian.h" />
+    <ClInclude Include="..\src\rdfloat.h" />
     <ClInclude Include="..\src\rdgz.h" />
     <ClInclude Include="..\src\rdinterval.h" />
+    <ClInclude Include="..\src\rdkafka_admin.h" />
     <ClInclude Include="..\src\rdkafka_assignor.h" />
     <ClInclude Include="..\src\rdkafka_buf.h" />
     <ClInclude Include="..\src\rdkafka_cgrp.h" />
     <ClInclude Include="..\src\rdkafka_conf.h" />
+    <ClInclude Include="..\src\rdkafka_confval.h" />
     <ClInclude Include="..\src\rdkafka_event.h" />
     <ClInclude Include="..\src\rdkafka_feature.h" />
     <ClInclude Include="..\src\rdkafka_lz4.h" />
@@ -115,7 +118,6 @@
     <ClInclude Include="..\src\rdkafka_request.h" />
     <ClInclude Include="..\src\rdkafka_sasl.h" />
     <ClInclude Include="..\src\rdkafka_sasl_int.h" />
-    <ClInclude Include="..\src\rdkafka_subscription.h" />
     <ClInclude Include="..\src\rdkafka_transport_int.h" />
     <ClInclude Include="..\src\rdlist.h" />
     <ClInclude Include="..\src\rdposix.h" />
@@ -147,6 +149,7 @@
     <ClInclude Include="..\src\snappy.h" />
     <ClInclude Include="..\src\snappy_compat.h" />
     <ClInclude Include="..\src\tinycthread.h" />
+    <ClInclude Include="..\src\tinycthread_extra.h" />
     <ClInclude Include="..\src\rdwin32.h" />
     <ClInclude Include="..\src\win32_config.h" />
     <ClInclude Include="..\src\regexp.h" />
@@ -160,6 +163,7 @@
     <ClCompile Include="..\src\rdbuf.c" />
     <ClCompile Include="..\src\rdcrc32.c" />
     <ClCompile Include="..\src\rdgz.c" />
+    <ClCompile Include="..\src\rdhdrhistogram.c" />
     <ClCompile Include="..\src\rdkafka.c" />
     <ClCompile Include="..\src\rdkafka_assignor.c" />
     <ClCompile Include="..\src\rdkafka_broker.c" />
@@ -193,6 +197,10 @@
     <ClCompile Include="..\src\rdkafka_interceptor.c" />
     <ClCompile Include="..\src\rdkafka_plugin.c" />
     <ClCompile Include="..\src\rdkafka_header.c" />
+    <ClCompile Include="..\src\rdkafka_admin.c" />
+    <ClCompile Include="..\src\rdkafka_aux.c" />
+    <ClCompile Include="..\src\rdkafka_background.c" />
+    <ClCompile Include="..\src\rdkafka_idempotence.c" />
     <ClCompile Include="..\src\rdlist.c" />
     <ClCompile Include="..\src\rdlog.c" />
     <ClCompile Include="..\src\rdmurmur2.c" />
@@ -203,6 +211,7 @@
     <ClCompile Include="..\src\rdvarint.c" />
     <ClCompile Include="..\src\snappy.c" />
     <ClCompile Include="..\src\tinycthread.c" />
+    <ClCompile Include="..\src\tinycthread_extra.c" />
     <ClCompile Include="..\src\regexp.c" />
     <ClCompile Include="..\src\rdports.c" />
     <ClCompile Include="..\src\rdavl.c" />

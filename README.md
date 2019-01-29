@@ -1,7 +1,7 @@
 librdkafka - the Apache Kafka C/C++ client library
 ==================================================
 
-Copyright (c) 2012-2016, [Magnus Edenhill](http://www.edenhill.se/).
+Copyright (c) 2012-2018, [Magnus Edenhill](http://www.edenhill.se/).
 
 [https://github.com/edenhill/librdkafka](https://github.com/edenhill/librdkafka)
 
@@ -28,16 +28,16 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
   * High-level producer
   * High-level balanced KafkaConsumer (requires broker >= 0.9)
   * Simple (legacy) consumer
-  * Compression: snappy, gzip, lz4
+  * Compression: snappy, gzip, lz4, zstd
   * [SSL](https://github.com/edenhill/librdkafka/wiki/Using-SSL-with-librdkafka) support
   * [SASL](https://github.com/edenhill/librdkafka/wiki/Using-SASL-with-librdkafka) (GSSAPI/Kerberos/SSPI, PLAIN, SCRAM) support
   * Broker version support: >=0.8 (see [Broker version compatibility](https://github.com/edenhill/librdkafka/wiki/Broker-version-compatibility))
   * Stable C & C++ APIs (ABI safety guaranteed for C)
-  * [Statistics](https://github.com/edenhill/librdkafka/wiki/Statistics) metrics
+  * [Statistics](https://github.com/edenhill/librdkafka/blob/master/STATISTICS.md) metrics
   * Debian package: librdkafka1 and librdkafka-dev in Debian and Ubuntu
   * RPM package: librdkafka and librdkafka-devel
   * Gentoo package: dev-libs/librdkafka
-  * Portable: runs on Linux, OSX, Win32, Solaris, FreeBSD, ...
+  * Portable: runs on Linux, OSX, Win32, Solaris, FreeBSD, AIX, ...
 
 
 # Language bindings #
@@ -49,12 +49,8 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
   * Erlang: [erlkaf](https://github.com/silviucpp/erlkaf)
   * Go: [confluent-kafka-go](https://github.com/confluentinc/confluent-kafka-go)
   * Haskell (kafka, conduit, avro, schema registry): [hw-kafka](https://github.com/haskell-works/hw-kafka)
-  * Haskell: [haskakafka](https://github.com/cosbynator/haskakafka)
-  * Haskell: [haskell-kafka](https://github.com/yanatan16/haskell-kafka)
   * Lua: [luardkafka](https://github.com/mistsv/luardkafka)
   * Node.js: [node-rdkafka](https://github.com/Blizzard/node-rdkafka)
-  * Node.js: [node-kafka](https://github.com/sutoiku/node-kafka)
-  * Node.js: [kafka-native](https://github.com/jut-io/node-kafka-native)
   * OCaml: [ocaml-kafka](https://github.com/didier-wenzek/ocaml-kafka)
   * PHP: [phpkafka](https://github.com/EVODelavega/phpkafka)
   * PHP: [php-rdkafka](https://github.com/arnaud-lb/php-rdkafka)
@@ -85,6 +81,7 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
   * [Microwish](https://github.com/microwish) has a range of Kafka utilites for log aggregation, HDFS integration, etc.
   * [aidp](https://github.com/weiboad/aidp) - kafka consumer embedded Lua scripting language in data process framework
   * [Yandex ClickHouse](https://github.com/yandex/ClickHouse)
+  * [NXLog](http://nxlog.co/) - Enterprise logging system, Kafka input/output plugin.
   * large unnamed financial institutions
   * and many more..
   * *Let [me](mailto:rdkafka@edenhill.se) know if you are using librdkafka*
@@ -97,9 +94,18 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
 	The GNU toolchain
 	GNU make
    	pthreads
-	zlib (optional, for gzip compression support)
+	zlib-dev (optional, for gzip compression support)
 	libssl-dev (optional, for SSL and SASL SCRAM support)
 	libsasl2-dev (optional, for SASL GSSAPI support)
+	libzstd-dev (optional, for ZStd compression support)
+
+**NOTE**: Static linking of ZStd (requires zstd >= 1.2.1) in the producer
+          enables encoding the original size in the compression frame header,
+          which will speed up the consumer.
+          Use `STATIC_LIB_zstd=/path/to/libzstd.a ./configure --enable-static`
+          to enable static ZStd linking.
+          MacOSX example:
+          `STATIC_LIB_zstd=$(brew ls -v zstd | grep libzstd.a$) ./configure --enable-static`
 
 ## Instructions
 

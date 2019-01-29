@@ -1,4 +1,33 @@
-#pragma once
+/*
+ * librdkafka - Apache Kafka C library
+ *
+ * Copyright (c) 2014-2018 Magnus Edenhill
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#ifndef _RDKAFKA_CONF_H_
+#define _RDKAFKA_CONF_H_
 
 #include "rdlist.h"
 
@@ -16,10 +45,37 @@ typedef enum {
 	RD_KAFKA_COMPRESSION_NONE,
 	RD_KAFKA_COMPRESSION_GZIP = RD_KAFKA_MSG_ATTR_GZIP,
 	RD_KAFKA_COMPRESSION_SNAPPY = RD_KAFKA_MSG_ATTR_SNAPPY,
-        RD_KAFKA_COMPRESSION_LZ4 = RD_KAFKA_MSG_ATTR_LZ4,
-	RD_KAFKA_COMPRESSION_INHERIT /* Inherit setting from global conf */
+	RD_KAFKA_COMPRESSION_LZ4 = RD_KAFKA_MSG_ATTR_LZ4,
+	RD_KAFKA_COMPRESSION_ZSTD = RD_KAFKA_MSG_ATTR_ZSTD,
+	RD_KAFKA_COMPRESSION_INHERIT, /* Inherit setting from global conf */
+        RD_KAFKA_COMPRESSION_NUM
 } rd_kafka_compression_t;
 
+static RD_INLINE RD_UNUSED const char *
+rd_kafka_compression2str (rd_kafka_compression_t compr) {
+        static const char *names[RD_KAFKA_COMPRESSION_NUM] = {
+                [RD_KAFKA_COMPRESSION_NONE] = "none",
+                [RD_KAFKA_COMPRESSION_GZIP] = "gzip",
+                [RD_KAFKA_COMPRESSION_SNAPPY] = "snappy",
+                [RD_KAFKA_COMPRESSION_LZ4] = "lz4",
+                [RD_KAFKA_COMPRESSION_ZSTD] = "zstd",
+                [RD_KAFKA_COMPRESSION_INHERIT] = "inherit"
+        };
+        return names[compr];
+}
+
+/**
+ * MessageSet compression levels
+ */
+typedef enum {
+	RD_KAFKA_COMPLEVEL_DEFAULT = -1,
+	RD_KAFKA_COMPLEVEL_MIN = -1,
+	RD_KAFKA_COMPLEVEL_GZIP_MAX = 9,
+	RD_KAFKA_COMPLEVEL_LZ4_MAX = 12,
+	RD_KAFKA_COMPLEVEL_SNAPPY_MAX = 0,
+	RD_KAFKA_COMPLEVEL_ZSTD_MAX = 22,
+	RD_KAFKA_COMPLEVEL_MAX = 12
+} rd_kafka_complevel_t;
 
 typedef enum {
 	RD_KAFKA_PROTO_PLAINTEXT,
@@ -34,15 +90,37 @@ typedef enum {
 	RD_KAFKA_CONFIGURED,
 	RD_KAFKA_LEARNED,
 	RD_KAFKA_INTERNAL,
+        RD_KAFKA_LOGICAL
 } rd_kafka_confsource_t;
+
+static RD_INLINE RD_UNUSED
+const char *rd_kafka_confsource2str (rd_kafka_confsource_t source) {
+        static const char *names[] = {
+                "configured",
+                "learned",
+                "internal",
+                "logical"
+        };
+
+        return names[source];
+}
+
 
 typedef	enum {
 	_RK_GLOBAL = 0x1,
 	_RK_PRODUCER = 0x2,
 	_RK_CONSUMER = 0x4,
 	_RK_TOPIC = 0x8,
-        _RK_CGRP = 0x10
+        _RK_CGRP = 0x10,
+        _RK_DEPRECATED = 0x20,
+        _RK_HIDDEN = 0x40,
+        _RK_HIGH = 0x80, /* High Importance */
+        _RK_MED = 0x100  /* Medium Importance */
 } rd_kafka_conf_scope_t;
+
+/**< While the client groups is a generic concept, it is currently
+ *   only implemented for consumers in librdkafka. */
+#define _RK_CGRP _RK_CONSUMER
 
 typedef enum {
 	_RK_CONF_PROP_SET_REPLACE,  /* Replace current value (default) */
@@ -60,6 +138,19 @@ typedef enum {
 
 
 
+/* Increase in steps of 64 as needed. */
+#define RD_KAFKA_CONF_PROPS_IDX_MAX (64*24)
+
+/**
+ * @struct rd_kafka_anyconf_t
+ * @brief The anyconf header must be the first field in the
+ *        rd_kafka_conf_t and rd_kafka_topic_conf_t structs.
+ *        It provides a way to track which property has been modified.
+ */
+struct rd_kafka_anyconf_hdr {
+        uint64_t modified[RD_KAFKA_CONF_PROPS_IDX_MAX/64];
+};
+
 
 /**
  * Optional configuration struct passed to rd_kafka_new*().
@@ -69,6 +160,8 @@ typedef enum {
  *
  */
 struct rd_kafka_conf_s {
+        struct rd_kafka_anyconf_hdr hdr;  /**< Must be first field */
+
 	/*
 	 * Generic configuration
 	 */
@@ -97,7 +190,11 @@ struct rd_kafka_conf_s {
 	char   *brokerlist;
 	int     stats_interval_ms;
 	int     term_sig;
+        int     reconnect_backoff_ms;
+        int     reconnect_backoff_max_ms;
         int     reconnect_jitter_ms;
+        int     sparse_connections;
+        int     sparse_connect_intvl;
 	int     api_version_request;
 	int     api_version_request_timeout_ms;
 	int     api_version_fallback_ms;
@@ -108,6 +205,10 @@ struct rd_kafka_conf_s {
 	struct {
 		SSL_CTX *ctx;
 		char *cipher_suites;
+#if OPENSSL_VERSION_NUMBER >= 0x1000200fL && !defined(LIBRESSL_VERSION_NUMBER)
+		char *curves_list;
+		char *sigalgs_list;
+#endif
 		char *key_location;
 		char *key_password;
 		char *cert_location;
@@ -158,6 +259,7 @@ struct rd_kafka_conf_s {
                 rd_list_t on_acknowledgement; /* .. (copied) */
                 rd_list_t on_consume;         /* .. (copied) */
                 rd_list_t on_commit;          /* .. (copied) */
+                rd_list_t on_request_sent;    /* .. (copied) */
 
                 /* rd_strtup_t list */
                 rd_list_t config;             /* Configuration name=val's
@@ -166,6 +268,7 @@ struct rd_kafka_conf_s {
 
         /* Client group configuration */
         int    coord_query_intvl_ms;
+        int    max_poll_interval_ms;
 
 	int    builtin_features;
 	/*
@@ -177,6 +280,7 @@ struct rd_kafka_conf_s {
         int64_t queued_max_msg_bytes;
 	int    fetch_wait_max_ms;
         int    fetch_msg_max_bytes;
+        int    fetch_max_bytes;
 	int    fetch_min_bytes;
 	int    fetch_error_backoff_ms;
         char  *group_id_str;
@@ -212,9 +316,16 @@ struct rd_kafka_conf_s {
 	/*
 	 * Producer configuration
 	 */
+        struct {
+                int    idempotence;  /**< Enable Idempotent Producer */
+                rd_bool_t gapless;   /**< Raise fatal error if
+                                      *   gapless guarantee can't be
+                                      *   satisfied. */
+        } eos;
 	int    queue_buffering_max_msgs;
 	int    queue_buffering_max_kbytes;
 	int    buffering_max_ms;
+        int    queue_backpressure_thres;
 	int    max_retries;
 	int    retry_backoff_ms;
 	int    batch_num_messages;
@@ -289,11 +400,35 @@ struct rd_kafka_conf_s {
         int (*open_cb) (const char *pathname, int flags, mode_t mode,
                         void *opaque);
 
+        /* Background queue event callback */
+        void (*background_event_cb) (rd_kafka_t *rk, rd_kafka_event_t *rkev,
+                                     void *opaque);
+
+
 	/* Opaque passed to callbacks. */
 	void  *opaque;
 
         /* For use with value-less properties. */
         int     dummy;
+
+
+        /* Admin client defaults */
+        struct {
+                int request_timeout_ms;  /* AdminOptions.request_timeout */
+        } admin;
+
+
+        /*
+         * Unit test pluggable interfaces
+         */
+        struct {
+                /**< Inject errors in ProduceResponse handler */
+                rd_kafka_resp_err_t (*handle_ProduceResponse) (
+                        rd_kafka_t *rk,
+                        int32_t brokerid,
+                        uint64_t msgid,
+                        rd_kafka_resp_err_t err);
+        } ut;
 };
 
 int rd_kafka_socket_cb_linux (int domain, int type, int protocol, void *opaque);
@@ -309,6 +444,8 @@ int rd_kafka_open_cb_generic (const char *pathname, int flags, mode_t mode,
 
 
 struct rd_kafka_topic_conf_s {
+        struct rd_kafka_anyconf_hdr hdr;  /**< Must be first field */
+
 	int     required_acks;
 	int32_t request_timeout_ms;
 	int     message_timeout_ms;
@@ -320,7 +457,11 @@ struct rd_kafka_topic_conf_s {
 				void *msg_opaque);
         char   *partitioner_str;
 
+        int queuing_strategy; /* RD_KAFKA_QUEUE_FIFO|LIFO */
+        int (*msg_order_cmp) (const void *a, const void *b);
+
 	rd_kafka_compression_t compression_codec;
+	rd_kafka_complevel_t compression_level;
         int     produce_offset_report;
 
         int     consume_callback_max_msgs;
@@ -339,3 +480,19 @@ struct rd_kafka_topic_conf_s {
 
 
 void rd_kafka_anyconf_destroy (int scope, void *conf);
+
+const char *rd_kafka_conf_finalize (rd_kafka_type_t cltype,
+                                    rd_kafka_conf_t *conf);
+const char *rd_kafka_topic_conf_finalize (rd_kafka_type_t cltype,
+                                          const rd_kafka_conf_t *conf,
+                                          rd_kafka_topic_conf_t *tconf);
+
+
+int rd_kafka_conf_warn (rd_kafka_t *rk);
+
+
+#include "rdkafka_confval.h"
+
+int unittest_conf (void);
+
+#endif /* _RDKAFKA_CONF_H_ */

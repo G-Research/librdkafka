@@ -26,7 +26,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#pragma once
+#ifndef _RDKAFKACPP_H_
+#define _RDKAFKACPP_H_
 
 /**
  * @file rdkafkacpp.h
@@ -49,8 +50,9 @@
 #include <string>
 #include <list>
 #include <vector>
+#include <cstdlib>
+#include <cstring>
 #include <stdint.h>
-
 
 #ifdef _MSC_VER
 #undef RD_EXPORT
@@ -69,8 +71,14 @@
 
 /**@endcond*/
 
-namespace RdKafka {
+extern "C" {
+        /* Forward declarations */
+        struct rd_kafka_s;
+        struct rd_kafka_topic_s;
+        struct rd_kafka_message_s;
+};
 
+namespace RdKafka {
 
 /**
  * @name Miscellaneous APIs
@@ -91,7 +99,7 @@ namespace RdKafka {
  * @remark This value should only be used during compile time,
  *         for runtime checks of version use RdKafka::version()
  */
-#define RD_KAFKA_VERSION  0x000b01ff
+#define RD_KAFKA_VERSION  0x010000ff
 
 /**
  * @brief Returns the librdkafka version as integer.
@@ -244,6 +252,22 @@ enum ErrorCode {
         ERR__NOENT = -156,
         /** Read underflow */
         ERR__UNDERFLOW = -155,
+        /** Invalid type */
+        ERR__INVALID_TYPE = -154,
+        /** Retry operation */
+        ERR__RETRY = -153,
+        /** Purged in queue */
+        ERR__PURGE_QUEUE = -152,
+        /** Purged in flight */
+        ERR__PURGE_INFLIGHT = -151,
+        /** Fatal error: see ::fatal_error() */
+        ERR__FATAL = -150,
+        /** Inconsistent state */
+        ERR__INCONSISTENT = -149,
+        /** Gap-less ordering would not be guaranteed if proceeding */
+        ERR__GAPLESS_GUARANTEE = -148,
+        /** Maximum poll interval exceeded */
+        ERR__MAX_POLL_EXCEEDED = -147,
 
         /** End internal error codes */
 	ERR__END = -100,
@@ -339,7 +363,7 @@ enum ErrorCode {
         ERR_INVALID_REQUEST = 42,
         /** Message format on broker does not support request */
         ERR_UNSUPPORTED_FOR_MESSAGE_FORMAT = 43,
-        /** Isolation policy volation */
+        /** Policy violation */
         ERR_POLICY_VIOLATION = 44,
         /** Broker received an out of order sequence number */
         ERR_OUT_OF_ORDER_SEQUENCE_NUMBER = 45,
@@ -367,7 +391,45 @@ enum ErrorCode {
         /** Security features are disabled */
         ERR_SECURITY_DISABLED = 54,
         /** Operation not attempted */
-        ERR_OPERATION_NOT_ATTEMPTED = 55
+        ERR_OPERATION_NOT_ATTEMPTED = 55,
+        /** Disk error when trying to access log file on the disk */
+        ERR_KAFKA_STORAGE_ERROR = 56,
+        /** The user-specified log directory is not found in the broker config */
+        ERR_LOG_DIR_NOT_FOUND = 57,
+        /** SASL Authentication failed */
+        ERR_SASL_AUTHENTICATION_FAILED = 58,
+        /** Unknown Producer Id */
+        ERR_UNKNOWN_PRODUCER_ID = 59,
+        /** Partition reassignment is in progress */
+        ERR_REASSIGNMENT_IN_PROGRESS = 60,
+        /** Delegation Token feature is not enabled */
+        ERR_DELEGATION_TOKEN_AUTH_DISABLED = 61,
+        /** Delegation Token is not found on server */
+        ERR_DELEGATION_TOKEN_NOT_FOUND = 62,
+        /** Specified Principal is not valid Owner/Renewer */
+        ERR_DELEGATION_TOKEN_OWNER_MISMATCH = 63,
+        /** Delegation Token requests are not allowed on this connection */
+        ERR_DELEGATION_TOKEN_REQUEST_NOT_ALLOWED = 64,
+        /** Delegation Token authorization failed */
+        ERR_DELEGATION_TOKEN_AUTHORIZATION_FAILED = 65,
+        /** Delegation Token is expired */
+        ERR_DELEGATION_TOKEN_EXPIRED = 66,
+        /** Supplied principalType is not supported */
+        ERR_INVALID_PRINCIPAL_TYPE = 67,
+        /** The group is not empty */
+        ERR_NON_EMPTY_GROUP = 68,
+        /** The group id does not exist */
+        ERR_GROUP_ID_NOT_FOUND = 69,
+        /** The fetch session ID was not found */
+        ERR_FETCH_SESSION_ID_NOT_FOUND = 70,
+        /** The fetch session epoch is invalid */
+        ERR_INVALID_FETCH_SESSION_EPOCH = 71,
+        /** No matching listener */
+        ERR_LISTENER_NOT_FOUND = 72,
+        /** Topic deletion is disabled */
+        ERR_TOPIC_DELETION_DISABLED = 73,
+        /** Unsupported compression type */
+        ERR_UNSUPPORTED_COMPRESSION_TYPE = 74
 };
 
 
@@ -386,6 +448,7 @@ std::string  err2str(RdKafka::ErrorCode err);
 /* Forward declarations */
 class Producer;
 class Message;
+class Headers;
 class Queue;
 class Event;
 class Topic;
@@ -595,6 +658,14 @@ class RD_EXPORT Event {
    * @remark Applies to THROTTLE event type.
    */
   virtual int         broker_id () const = 0;
+
+
+  /**
+   * @returns true if this is a fatal error.
+   * @remark Applies to ERROR event type.
+   * @sa RdKafka::Handle::fatal_error()
+   */
+  virtual bool        fatal () const = 0;
 };
 
 
@@ -618,12 +689,12 @@ class RD_EXPORT ConsumeCb {
 
 
 /**
- * @brief \b KafkaConsunmer: Rebalance callback class
+ * @brief \b KafkaConsumer: Rebalance callback class
  */
 class RD_EXPORT RebalanceCb {
 public:
   /**
-   * @brief Group rebalance callback for use with RdKafka::KafkaConsunmer
+   * @brief Group rebalance callback for use with RdKafka::KafkaConsumer
    *
    * Registering a \p rebalance_cb turns off librdkafka's automatic
    * partition assignment/revocation and instead delegates that responsibility
@@ -1082,6 +1153,8 @@ class RD_EXPORT Handle {
    * on input, and \c offset() will return the closest earlier offset
    * for the timestamp on output.
    *
+   * Timestamps are expressed as milliseconds since epoch (UTC).
+   *
    * The function will block for at most \p timeout_ms milliseconds.
    *
    * @remark Duplicate Topic+Partitions are not supported.
@@ -1150,6 +1223,65 @@ class RD_EXPORT Handle {
    *          retrieved in the allotted timespan.
    */
   virtual const std::string clusterid (int timeout_ms) = 0;
+
+  /**
+   * @brief Returns the underlying librdkafka C rd_kafka_t handle.
+   *
+   * @warning Calling the C API on this handle is not recommended and there
+   *          is no official support for it, but for cases where the C++
+   *          does not provide the proper functionality this C handle can be
+   *          used to interact directly with the core librdkafka API.
+   *
+   * @remark The lifetime of the returned pointer is the same as the Topic
+   *         object this method is called on.
+   *
+   * @remark Include <rdkafka/rdkafka.h> prior to including
+   *         <rdkafka/rdkafkacpp.h>
+   *
+   * @returns \c rd_kafka_t*
+   */
+  virtual struct rd_kafka_s *c_ptr () = 0;
+
+  /**
+   * @brief Returns the current ControllerId (controller broker id)
+   *        as reported in broker metadata.
+   *
+   * @param timeout_ms If there is no cached value from metadata retrieval
+   *                   then this specifies the maximum amount of time
+   *                   (in milliseconds) the call will block waiting
+   *                   for metadata to be retrieved.
+   *                   Use 0 for non-blocking calls.
+   *
+   * @remark Requires broker version >=0.10.0 and api.version.request=true.
+   *
+   * @returns Last cached ControllerId, or -1 if no ControllerId could be
+   *          retrieved in the allotted timespan.
+   */
+  virtual int32_t controllerid (int timeout_ms) = 0;
+
+
+  /**
+   * @brief Returns the first fatal error set on this client instance,
+   *        or ERR_NO_ERROR if no fatal error has occurred.
+   *
+   * This function is to be used with the Idempotent Producer and
+   * the Event class for \c EVENT_ERROR events to detect fatal errors.
+   *
+   * Generally all errors raised by the error event are to be considered
+   * informational and temporary, the client will try to recover from all
+   * errors in a graceful fashion (by retrying, etc).
+   *
+   * However, some errors should logically be considered fatal to retain
+   * consistency; in particular a set of errors that may occur when using the
+   * Idempotent Producer and the in-order or exactly-once producer guarantees
+   * can't be satisfied.
+   *
+   * @param errstr A human readable error string if a fatal error was set.
+   *
+   * @returns ERR_NO_ERROR if no fatal error has been raised, else
+   *          any other error code.
+   */
+  virtual ErrorCode fatal_error (std::string &errstr) = 0;
 };
 
 
@@ -1266,6 +1398,24 @@ class RD_EXPORT Topic {
    *          offsets could be stored.
    */
   virtual ErrorCode offset_store (int32_t partition, int64_t offset) = 0;
+
+  /**
+   * @brief Returns the underlying librdkafka C rd_kafka_topic_t handle.
+   *
+   * @warning Calling the C API on this handle is not recommended and there
+   *          is no official support for it, but for cases where the C++ API
+   *          does not provide the underlying functionality this C handle can be
+   *          used to interact directly with the core librdkafka API.
+   *
+   * @remark The lifetime of the returned pointer is the same as the Topic
+   *         object this method is called on.
+   *
+   * @remark Include <rdkafka/rdkafka.h> prior to including
+   *         <rdkafka/rdkafkacpp.h>
+   *
+   * @returns \c rd_kafka_topic_t*
+   */
+  virtual struct rd_kafka_topic_s *c_ptr () = 0;
 };
 
 
@@ -1303,6 +1453,238 @@ public:
 };
 
 
+/**
+ * @brief Headers object
+ *
+ * Represents message headers.
+ *
+ * https://cwiki.apache.org/confluence/display/KAFKA/KIP-82+-+Add+Record+Headers
+ * 
+ * @remark Requires Apache Kafka >= 0.11.0 brokers
+ */
+class RD_EXPORT Headers {
+public:
+  virtual ~Headers() = 0;
+
+  /**
+   * @brief Header object
+   *
+   * This object represents a single Header with a key value pair
+   * and an ErrorCode
+   *
+   * @remark dynamic allocation of this object is not supported.
+   */
+  class Header {
+   public:
+    /**
+     * @brief Header object to encapsulate a single Header
+     *
+     * @param key the string value for the header key
+     * @param value the bytes of the header value, or NULL
+     * @param value_size the length in bytes of the header value
+     *
+     * @remark key and value are copied.
+     *
+     */
+    Header(const std::string &key,
+           const void *value,
+           size_t value_size):
+    key_(key), err_(ERR_NO_ERROR), value_size_(value_size) {
+      value_ = copy_value(value, value_size);
+    }
+
+    /**
+     * @brief Header object to encapsulate a single Header
+     *
+     * @param key the string value for the header key
+     * @param value the bytes of the header value
+     * @param value_size the length in bytes of the header value
+     * @param err the error code if one returned
+     *
+     * @remark The error code is used for when the Header is constructed
+     *         internally by using RdKafka::Headers::get_last which constructs
+     *         a Header encapsulating the ErrorCode in the process
+     */
+    Header(const std::string &key,
+           const void *value,
+           size_t value_size,
+           const RdKafka::ErrorCode err):
+    key_(key), err_(err), value_size_(value_size) {
+        value_ = copy_value(value, value_size);
+    }
+
+    /**
+     * @brief Copy constructor
+     *
+     * @param other other Header used for the copy constructor
+     */
+    Header(const Header &other):
+    key_(other.key_), err_(other.err_), value_size_(other.value_size_) {
+      value_ = copy_value(other.value_, value_size_);
+    }
+
+    Header& operator=(const Header &other)
+    {
+      if (&other == this) {
+        return *this;
+      }
+
+      key_ = other.key_;
+      err_ = other.err_;
+      value_size_ = other.value_size_;
+
+      value_ = copy_value(other.value_, value_size_);
+
+      return *this;
+    }
+
+    ~Header() {
+      if (value_ != NULL)
+        free(value_);
+    }
+
+    /** @returns the key/name associated with this Header */
+    std::string key() const {
+      return key_;
+    }
+
+     /** @returns returns the binary value, or NULL */
+    const void *value() const {
+      return value_;
+    }
+
+    /** @returns returns the value casted to a nul-terminated C string,
+     *           or NULL. */
+    const char *value_string() const {
+      return static_cast<const char *>(value_);
+    }
+
+    /** @returns Value Size the length of the Value in bytes */
+    size_t value_size() const {
+      return value_size_;
+    }
+
+    /** @returns the error code of this Header (usually ERR_NO_ERROR) */
+    RdKafka::ErrorCode err() const {
+      return err_;
+    }
+
+ private:
+    char *copy_value(const void *value, size_t value_size) {
+      if (!value)
+        return NULL;
+
+      char *dest = (char *)malloc(value_size + 1);
+      memcpy(dest, (const char *)value, value_size);
+      dest[value_size] = '\0';
+
+      return dest;
+    }
+
+    std::string key_;
+    RdKafka::ErrorCode err_;
+    char *value_;
+    size_t value_size_;
+    void *operator new(size_t); /* Prevent dynamic allocation */
+  };
+
+  /**
+   * @brief Create a new instance of the Headers object
+   * 
+   * @returns an empty Headers list
+   */
+  static Headers *create();
+
+  /**
+   * @brief Create a new instance of the Headers object from a std::vector
+   * 
+   * @params headers std::vector of RdKafka::Headers::Header objects.
+   *                 The headers are copied, not referenced.
+   * 
+   * @returns a Headers list from std::vector set to the size of the std::vector
+   */
+  static Headers *create(const std::vector<Header> &headers);
+
+  /**
+   * @brief Adds a Header to the end of the list.
+   * 
+   * @param key header key/name
+   * @param value binary value, or NULL
+   * @param value_size size of the value
+   *
+   * @returns an ErrorCode signalling success or failure to add the header.
+   */
+  virtual ErrorCode add(const std::string &key, const void *value,
+                        size_t value_size) = 0;
+
+  /**
+   * @brief Adds a Header to the end of the list.
+   *
+   * Convenience method for adding a std::string as a value for the header.
+   * 
+   * @param key header key/name
+   * @param value value string
+   * 
+   * @returns an ErrorCode signalling success or failure to add the header.
+   */
+  virtual ErrorCode add(const std::string &key, const std::string &value) = 0;
+
+  /**
+   * @brief Adds a Header to the end of the list.
+   *
+   * This method makes a copy of the passed header.
+   *
+   * @param header Existing header to copy
+   *
+   * @returns an ErrorCode signalling success or failure to add the header.
+   */
+  virtual ErrorCode add(const Header &header) = 0;
+
+  /**
+   * @brief Removes all the Headers of a given key
+   * 
+   * @param key header key/name to remove
+   * 
+   * @returns An ErrorCode signalling a success or failure to remove the Header.
+   */
+  virtual ErrorCode remove(const std::string &key) = 0;
+
+  /**
+   * @brief Gets all of the Headers of a given key
+   * 
+   * @param key header key/name
+   * 
+   * @remark If duplicate keys exist this will return them all as a std::vector
+   *
+   * @returns a std::vector containing all the Headers of the given key.
+   */
+  virtual std::vector<Header> get(const std::string &key) const = 0;
+
+  /**
+   * @brief Gets the last occurrence of a Header of a given key
+   * 
+   * @param key header key/name
+   * 
+   * @remark This will only return the most recently added header
+   *
+   * @returns the Header if found, otherwise a Header with an err set to
+   *          ERR__NOENT.
+   */
+  virtual Header get_last(const std::string &key) const = 0;
+
+  /**
+   * @brief Returns all Headers
+   *
+   * @returns a std::vector containing all of the Headers
+   */
+  virtual std::vector<Header> get_all() const = 0;
+
+  /**
+   * @returns the number of headers.
+   */
+  virtual size_t size() const = 0;
+};
+
 
 /**
  * @brief Message object
@@ -1317,6 +1699,25 @@ public:
  */
 class RD_EXPORT Message {
  public:
+  /** @brief Message persistance status can be used by the application to
+   *         find out if a produced message was persisted in the topic log. */
+  enum Status {
+    /**< Message was never transmitted to the broker, or failed with
+     *   an error indicating it was not written to the log.
+     *   Application retry risks ordering, but not duplication. */
+    MSG_STATUS_NOT_PERSISTED = 0,
+
+    /**< Message was transmitted to broker, but no acknowledgement was
+     *   received.
+     *   Application retry risks ordering and duplication. */
+    MSG_STATUS_POSSIBLY_PERSISTED = 1,
+
+    /**< Message was written to the log and fully acknowledged.
+     *   No reason for application to retry.
+     *   Note: this value should only be trusted with \c acks=all. */
+    MSG_STATUS_PERSISTED =  2
+  };
+
   /**
    * @brief Accessor functions*
    * @remark Not all fields are present in all types of callbacks.
@@ -1370,6 +1771,43 @@ class RD_EXPORT Message {
   /** @returns the latency in microseconds for a produced message measured
    *           from the produce() call, or -1 if latency is not available. */
   virtual int64_t             latency () const = 0;
+
+  /**
+   * @brief Returns the underlying librdkafka C rd_kafka_message_t handle.
+   *
+   * @warning Calling the C API on this handle is not recommended and there
+   *          is no official support for it, but for cases where the C++ API
+   *          does not provide the underlying functionality this C handle can be
+   *          used to interact directly with the core librdkafka API.
+   *
+   * @remark The lifetime of the returned pointer is the same as the Message
+   *         object this method is called on.
+   *
+   * @remark Include <rdkafka/rdkafka.h> prior to including
+   *         <rdkafka/rdkafkacpp.h>
+   *
+   * @returns \c rd_kafka_message_t*
+   */
+  virtual struct rd_kafka_message_s *c_ptr () = 0;
+
+  /**
+   * @brief Returns the message's persistance status in the topic log.
+   */
+  virtual Status status () const = 0;
+
+  /** @returns the Headers instance for this Message, or NULL if there
+   *  are no headers.
+   *
+   * @remark The lifetime of the Headers are the same as the Message. */
+  virtual RdKafka::Headers   *headers () = 0;
+
+  /** @returns the Headers instance for this Message (if applicable).
+   *  If NULL is returned the reason is given in \p err, which
+   *  is either ERR__NOENT if there were no headers, or another
+   *  error code if header parsing failed.
+   *
+   * @remark The lifetime of the Headers are the same as the Message. */
+  virtual RdKafka::Headers   *headers (RdKafka::ErrorCode *err) = 0;
 };
 
 /**@}*/
@@ -1513,7 +1951,7 @@ public:
    * topics's partitions to the consumers, depending on their subscription.
    *
    * The result of such an assignment is a rebalancing which is either
-   * handled automatically in librdkafka or can be overriden by the application
+   * handled automatically in librdkafka or can be overridden by the application
    * by providing a RdKafka::RebalanceCb.
    *
    * The rebalancing passes the assigned partition set to
@@ -1947,15 +2385,17 @@ class RD_EXPORT Producer : public virtual Handle {
   /**
    * @brief RdKafka::Producer::produce() \p msgflags
    *
-   * These flags are optional and mutually exclusive.
+   * These flags are optional.
    */
   enum {
     RK_MSG_FREE = 0x1, /**< rdkafka will free(3) \p payload
-                         * when it is done with it. */
+                         * when it is done with it.
+                         * Mutually exclusive with RK_MSG_COPY. */
     RK_MSG_COPY = 0x2, /**< the \p payload data will be copied
                         * and the \p payload pointer will not
                         * be used by rdkafka after the
-                        * call returns. */
+                        * call returns.
+                        * Mutually exclusive with RK_MSG_FREE. */
     RK_MSG_BLOCK = 0x4  /**< Block produce*() on message queue
                          *   full.
                          *   WARNING:
@@ -2059,14 +2499,28 @@ class RD_EXPORT Producer : public virtual Handle {
   /**
    * @brief produce() variant that takes topic as a string (no need for
    *        creating a Topic object), and also allows providing the
-   *        message timestamp (microseconds since beginning of epoch, UTC).
+   *        message timestamp (milliseconds since beginning of epoch, UTC).
    *        Otherwise identical to produce() above.
    */
   virtual ErrorCode produce (const std::string topic_name, int32_t partition,
                              int msgflags,
                              void *payload, size_t len,
                              const void *key, size_t key_len,
+                             int64_t timestamp, void *msg_opaque) = 0;
+
+  /**
+   * @brief produce() variant that that allows for Header support on produce
+   *        Otherwise identical to produce() above.
+   *
+   * @warning The \p headers will be freed/deleted if the produce() call
+   *          succeeds, or left untouched if produce() fails.
+   */
+  virtual ErrorCode produce (const std::string topic_name, int32_t partition,
+                             int msgflags,
+                             void *payload, size_t len,
+                             const void *key, size_t key_len,
                              int64_t timestamp,
+                             RdKafka::Headers *headers,
                              void *msg_opaque) = 0;
 
 
@@ -2092,6 +2546,54 @@ class RD_EXPORT Producer : public virtual Handle {
    *          outstanding requests were completed, else ERR_NO_ERROR
    */
   virtual ErrorCode flush (int timeout_ms) = 0;
+
+
+  /**
+   * @brief Purge messages currently handled by the producer instance.
+   *
+   * @param purge_flags tells which messages should be purged and how.
+   *
+   * The application will need to call ::poll() or ::flush()
+   * afterwards to serve the delivery report callbacks of the purged messages.
+   *
+   * Messages purged from internal queues fail with the delivery report
+   * error code set to ERR__PURGE_QUEUE, while purged messages that
+   * are in-flight to or from the broker will fail with the error code set to
+   * ERR__PURGE_INFLIGHT.
+   *
+   * @warning Purging messages that are in-flight to or from the broker
+   *          will ignore any sub-sequent acknowledgement for these messages
+   *          received from the broker, effectively making it impossible
+   *          for the application to know if the messages were successfully
+   *          produced or not. This may result in duplicate messages if the
+   *          application retries these messages at a later time.
+   *
+   * @remark This call may block for a short time while background thread
+   *         queues are purged.
+   *
+   * @returns ERR_NO_ERROR on success,
+   *          ERR__INVALID_ARG if the \p purge flags are invalid or unknown,
+   *          ERR__NOT_IMPLEMENTED if called on a non-producer client instance.
+   */
+  virtual ErrorCode purge (int purge_flags) = 0;
+
+  /**
+   * @brief RdKafka::Handle::purge() \p purge_flags
+   */
+  enum {
+    PURGE_QUEUE = 0x1, /**< Purge messages in internal queues */
+
+    PURGE_INFLIGHT = 0x2, /*! Purge messages in-flight to or from the broker.
+                           *  Purging these messages will void any future
+                           *  acknowledgements from the broker, making it
+                           *  impossible for the application to know if these
+                           *  messages were successfully delivered or not.
+                           *  Retrying these messages may lead to duplicates. */
+
+    PURGE_NON_BLOCKING = 0x4 /* Don't wait for background queue
+                              * purging to finish. */
+  };
+
 };
 
 /**@}*/
@@ -2219,3 +2721,4 @@ class Metadata {
 
 }
 
+#endif /* _RDKAFKACPP_H_ */

@@ -25,7 +25,8 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#pragma once
+#ifndef _RDKAFKA_BUF_H_
+#define _RDKAFKA_BUF_H_
 
 #include "rdkafka_int.h"
 #include "rdcrc32.h"
@@ -300,7 +301,7 @@ rd_tmpabuf_write_str0 (const char *func, int line,
 #define rd_kafka_buf_read_i16(rkbuf,dstptr) do {                        \
                 int16_t _v;                                             \
                 rd_kafka_buf_read(rkbuf, &_v, sizeof(_v));              \
-                *(dstptr) = be16toh(_v);                                \
+                *(dstptr) = (int16_t)be16toh(_v);                       \
         } while (0)
 
 
@@ -313,6 +314,13 @@ rd_tmpabuf_write_str0 (const char *func, int line,
 #define rd_kafka_buf_read_i8(rkbuf, dst) rd_kafka_buf_read(rkbuf, dst, 1)
 
 #define rd_kafka_buf_peek_i8(rkbuf,of,dst) rd_kafka_buf_peek(rkbuf,of,dst,1)
+
+#define rd_kafka_buf_read_bool(rkbuf, dstptr) do {                      \
+                int8_t _v;                                              \
+                rd_bool_t *_dst = dstptr;                               \
+                rd_kafka_buf_read(rkbuf, &_v, 1);                       \
+                *_dst = (rd_bool_t)_v;                                  \
+        } while (0)
 
 
 /**
@@ -333,7 +341,7 @@ rd_tmpabuf_write_str0 (const char *func, int line,
                 int _klen;                                              \
                 rd_kafka_buf_read_i16a(rkbuf, (kstr)->len);             \
                 _klen = RD_KAFKAP_STR_LEN(kstr);                        \
-                if (RD_KAFKAP_STR_LEN0(_klen) == 0)                     \
+                if (RD_KAFKAP_STR_IS_NULL(kstr))                        \
                         (kstr)->str = NULL;                             \
                 else if (!((kstr)->str =                                \
                            rd_slice_ensure_contig(&rkbuf->rkbuf_reader, \
@@ -424,6 +432,19 @@ rd_tmpabuf_write_str0 (const char *func, int line,
 
 
 /**
+ * @brief Read throttle_time_ms (i32) from response and pass the value
+ *        to the throttle handling code.
+ */
+#define rd_kafka_buf_read_throttle_time(rkbuf) do {                     \
+                int32_t _throttle_time_ms;                              \
+                rd_kafka_buf_read_i32(rkbuf, &_throttle_time_ms);       \
+                rd_kafka_op_throttle_time((rkbuf)->rkbuf_rkb,           \
+                                          (rkbuf)->rkbuf_rkb->rkb_rk->rk_rep, \
+                                          _throttle_time_ms);           \
+        } while (0)
+
+
+/**
  * Response handling callback.
  *
  * NOTE: Callbacks must check for 'err == RD_KAFKA_RESP_ERR__DESTROY'
@@ -450,6 +471,8 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 
 	int     rkbuf_flags; /* RD_KAFKA_OP_F */
 
+        rd_kafka_prio_t rkbuf_prio; /**< Request priority */
+
         rd_buf_t rkbuf_buf;        /**< Send/Recv byte buffer */
         rd_slice_t rkbuf_reader;   /**< Buffer slice reader for rkbuf_buf */
 
@@ -463,7 +486,12 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 	struct rd_kafkap_reqhdr rkbuf_reqhdr;   /* Request header.
                                                  * These fields are encoded
                                                  * and written to output buffer
-                                                 * on buffer finalization. */
+                                                 * on buffer finalization.
+                                                 * Note:
+                                                 * The request's
+                                                 * reqhdr is copied to the
+                                                 * response's reqhdr as a
+                                                 * convenience. */
 	struct rd_kafkap_reshdr rkbuf_reshdr;   /* Response header.
                                                  * Decoded fields are copied
                                                  * here from the buffer
@@ -495,7 +523,50 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 	rd_ts_t rkbuf_ts_enq;
 	rd_ts_t rkbuf_ts_sent;    /* Initially: Absolute time of transmission,
 				   * after response: RTT. */
-	rd_ts_t rkbuf_ts_timeout;
+
+        /* Request timeouts:
+         *  rkbuf_ts_timeout is the effective absolute request timeout used
+         *  by the timeout scanner to see if a request has timed out.
+         *  It is set when a request is enqueued on the broker transmit
+         *  queue based on the relative or absolute timeout:
+         *
+         *  rkbuf_rel_timeout is the per-request-transmit relative timeout,
+         *  this value is reused for each sub-sequent retry of a request.
+         *
+         *  rkbuf_abs_timeout is the absolute request timeout, spanning
+         *  all retries.
+         *  This value is effectively limited by socket.timeout.ms for
+         *  each transmission, but the absolute timeout for a request's
+         *  lifetime is the absolute value.
+         *
+         *  Use rd_kafka_buf_set_timeout() to set a relative timeout
+         *  that will be reused on retry,
+         *  or rd_kafka_buf_set_abs_timeout() to set a fixed absolute timeout
+         *  for the case where the caller knows the request will be
+         *  semantically outdated when that absolute time expires, such as for
+         *  session.timeout.ms-based requests.
+         *
+         * The decision to retry a request is delegated to the rkbuf_cb
+         * response callback, which should use rd_kafka_err_action()
+         * and check the return actions for RD_KAFKA_ERR_ACTION_RETRY to be set
+         * and then call rd_kafka_buf_retry().
+         * rd_kafka_buf_retry() will enqueue the request on the rkb_retrybufs
+         * queue with a backoff time of retry.backoff.ms.
+         * The rkb_retrybufs queue is served by the broker thread's timeout
+         * scanner.
+         * @warning rkb_retrybufs is NOT purged on broker down.
+         */
+        rd_ts_t rkbuf_ts_timeout; /* Request timeout (absolute time). */
+        rd_ts_t rkbuf_abs_timeout;/* Absolute timeout for request, including
+                                   * retries.
+                                   * Mutually exclusive with rkbuf_rel_timeout*/
+        int     rkbuf_rel_timeout;/* Relative timeout (ms), used for retries.
+                                   * Defaults to socket.timeout.ms.
+                                   * Mutually exclusive with rkbuf_abs_timeout*/
+        rd_bool_t rkbuf_force_timeout; /**< Force request timeout to be
+                                        *   remaining abs_timeout regardless
+                                        *   of socket.timeout.ms. */
+
 
         int64_t rkbuf_offset;     /* Used by OffsetCommit */
 
@@ -523,6 +594,12 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                         mtx_t *decr_lock;
 
                 } Metadata;
+                struct {
+                        shptr_rd_kafka_toppar_t *s_rktp;
+                        rd_kafka_pid_t pid;  /**< Producer Id and Epoch */
+                        int32_t base_seq;    /**< Base sequence */
+                        int64_t base_msgid;  /**< Base msgid */
+                } Produce;
         } rkbuf_u;
 
         const char *rkbuf_uflow_mitigation; /**< Buffer read underflow
@@ -535,6 +612,12 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 };
 
 
+/**
+ * @returns true if buffer has been sent on wire, else 0.
+ */
+#define rd_kafka_buf_was_sent(rkbuf)                    \
+        ((rkbuf)->rkbuf_flags & RD_KAFKA_OP_F_SENT)
+
 typedef struct rd_kafka_bufq_s {
 	TAILQ_HEAD(, rd_kafka_buf_s) rkbq_bufs;
 	rd_atomic32_t  rkbq_cnt;
@@ -542,6 +625,58 @@ typedef struct rd_kafka_bufq_s {
 } rd_kafka_bufq_t;
 
 #define rd_kafka_bufq_cnt(rkbq) rd_atomic32_get(&(rkbq)->rkbq_cnt)
+
+/**
+ * @brief Set buffer's request timeout to relative \p timeout_ms measured
+ *        from the time the buffer is sent on the underlying socket.
+ *
+ * @param now Reuse current time from existing rd_clock() var, else 0.
+ *
+ * The relative timeout value is reused upon request retry.
+ */
+static RD_INLINE void
+rd_kafka_buf_set_timeout (rd_kafka_buf_t *rkbuf, int timeout_ms, rd_ts_t now) {
+        if (!now)
+                now = rd_clock();
+        rkbuf->rkbuf_rel_timeout = timeout_ms;
+        rkbuf->rkbuf_abs_timeout = 0;
+}
+
+
+/**
+ * @brief Calculate the effective timeout for a request attempt
+ */
+void rd_kafka_buf_calc_timeout (const rd_kafka_t *rk, rd_kafka_buf_t *rkbuf,
+                                rd_ts_t now);
+
+
+/**
+ * @brief Set buffer's request timeout to relative \p timeout_ms measured
+ *        from \p now.
+ *
+ * @param now Reuse current time from existing rd_clock() var, else 0.
+ * @param force If true: force request timeout to be same as remaining
+ *                       abs timeout, regardless of socket.timeout.ms.
+ *              If false: cap each request timeout to socket.timeout.ms.
+ *
+ * The remaining time is used as timeout for request retries.
+ */
+static RD_INLINE void
+rd_kafka_buf_set_abs_timeout0 (rd_kafka_buf_t *rkbuf, int timeout_ms,
+                               rd_ts_t now, rd_bool_t force) {
+        if (!now)
+                now = rd_clock();
+        rkbuf->rkbuf_rel_timeout = 0;
+        rkbuf->rkbuf_abs_timeout = now + ((rd_ts_t)timeout_ms * 1000);
+        rkbuf->rkbuf_force_timeout = force;
+}
+
+#define rd_kafka_buf_set_abs_timeout(rkbuf,timeout_ms,now) \
+        rd_kafka_buf_set_abs_timeout0(rkbuf,timeout_ms,now,rd_false)
+
+
+#define rd_kafka_buf_set_abs_timeout_force(rkbuf,timeout_ms,now) \
+        rd_kafka_buf_set_abs_timeout0(rkbuf,timeout_ms,now,rd_true)
 
 
 #define rd_kafka_buf_keep(rkbuf) rd_refcnt_add(&(rkbuf)->rkbuf_refcnt)
@@ -860,3 +995,5 @@ rd_kafka_buf_version_outdated (const rd_kafka_buf_t *rkbuf, int version) {
         return rkbuf && rkbuf->rkbuf_replyq.version &&
                 rkbuf->rkbuf_replyq.version < version;
 }
+
+#endif /* _RDKAFKA_BUF_H_ */

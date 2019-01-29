@@ -26,7 +26,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#pragma once
+#ifndef _RDKAFKA_PROTO_H_
+#define _RDKAFKA_PROTO_H_
 
 
 #include "rdendian.h"
@@ -55,6 +56,8 @@ struct rd_kafkap_reqhdr {
 #define RD_KAFKAP_Metadata      3
 #define RD_KAFKAP_LeaderAndIsr  4
 #define RD_KAFKAP_StopReplica   5
+#define RD_KAFKAP_UpdateMetadata 6
+#define RD_KAFKAP_ControlledShutdown 7
 #define RD_KAFKAP_OffsetCommit  8
 #define RD_KAFKAP_OffsetFetch   9
 #define RD_KAFKAP_GroupCoordinator 10
@@ -81,7 +84,16 @@ struct rd_kafkap_reqhdr {
 #define RD_KAFKAP_DeleteAcls    31
 #define RD_KAFKAP_DescribeConfigs 32
 #define RD_KAFKAP_AlterConfigs  33
-#define RD_KAFKAP__NUM          34
+#define RD_KAFKAP_AlterReplicaLogDirs 34
+#define RD_KAFKAP_DescribeLogDirs 35
+#define RD_KAFKAP_SaslAuthenticate 36
+#define RD_KAFKAP_CreatePartitions 37
+#define RD_KAFKAP_CreateDelegationToken 38
+#define RD_KAFKAP_RenewDelegationToken 39
+#define RD_KAFKAP_ExpireDelegationToken 40
+#define RD_KAFKAP_DescribeDelegationToken 41
+#define RD_KAFKAP_DeleteGroups 42
+#define RD_KAFKAP__NUM         43
         int16_t  ApiVersion;
         int32_t  CorrId;
         /* ClientId follows */
@@ -109,6 +121,8 @@ const char *rd_kafka_ApiKey2str (int16_t ApiKey) {
                 [RD_KAFKAP_Metadata] = "Metadata",
                 [RD_KAFKAP_LeaderAndIsr] = "LeaderAndIsr",
                 [RD_KAFKAP_StopReplica] = "StopReplica",
+                [RD_KAFKAP_UpdateMetadata] = "UpdateMetadata",
+                [RD_KAFKAP_ControlledShutdown] = "ControlledShutdown",
                 [RD_KAFKAP_OffsetCommit] = "OffsetCommit",
                 [RD_KAFKAP_OffsetFetch] = "OffsetFetch",
                 [RD_KAFKAP_GroupCoordinator] = "GroupCoordinator",
@@ -134,7 +148,17 @@ const char *rd_kafka_ApiKey2str (int16_t ApiKey) {
                 [RD_KAFKAP_CreateAcls] = "CreateAcls",
                 [RD_KAFKAP_DeleteAcls] = "DeleteAcls",
                 [RD_KAFKAP_DescribeConfigs] = "DescribeConfigs",
-                [RD_KAFKAP_AlterConfigs] = "AlterConfigs"
+                [RD_KAFKAP_AlterConfigs] = "AlterConfigs",
+                [RD_KAFKAP_AlterReplicaLogDirs] = "AlterReplicaLogDirs",
+                [RD_KAFKAP_DescribeLogDirs] = "DescribeLogDirs",
+                [RD_KAFKAP_SaslAuthenticate] = "SaslAuthenticate",
+                [RD_KAFKAP_CreatePartitions] = "CreatePartitions",
+                [RD_KAFKAP_CreateDelegationToken] = "CreateDelegationToken",
+                [RD_KAFKAP_RenewDelegationToken] = "RenewDelegationToken",
+                [RD_KAFKAP_ExpireDelegationToken] = "ExpireDelegationToken",
+                [RD_KAFKAP_DescribeDelegationToken] = "DescribeDelegationToken",
+                [RD_KAFKAP_DeleteGroups] = "DeleteGroups"
+
         };
         static RD_TLS char ret[32];
 
@@ -220,6 +244,8 @@ typedef struct rd_kafkap_str_s {
 
 /* strndup() a Kafka string */
 #define RD_KAFKAP_STR_DUP(kstr) rd_strndup((kstr)->str, RD_KAFKAP_STR_LEN(kstr))
+
+#define RD_KAFKAP_STR_INITIALIZER { .len = RD_KAFKAP_STR_LEN_NULL, .str = NULL }
 
 /**
  * Frees a Kafka string previously allocated with `rd_kafkap_str_new()`
@@ -428,7 +454,7 @@ int rd_kafkap_bytes_cmp_data (const rd_kafkap_bytes_t *a,
 typedef struct rd_kafka_buf_s rd_kafka_buf_t;
 
 
-#define RD_KAFKA_NODENAME_SIZE  128
+#define RD_KAFKA_NODENAME_SIZE  256
 
 
 
@@ -496,4 +522,80 @@ typedef struct rd_kafka_buf_s rd_kafka_buf_t;
 #define RD_KAFKAP_MSGSET_V2_OF_LastOffsetDelta  (8+4+4+1+4+2)
 #define RD_KAFKAP_MSGSET_V2_OF_BaseTimestamp    (8+4+4+1+4+2+4)
 #define RD_KAFKAP_MSGSET_V2_OF_MaxTimestamp     (8+4+4+1+4+2+4+8)
+#define RD_KAFKAP_MSGSET_V2_OF_BaseSequence     (8+4+4+1+4+2+4+8+8+8+2)
 #define RD_KAFKAP_MSGSET_V2_OF_RecordCount      (8+4+4+1+4+2+4+8+8+8+2+4)
+
+
+
+
+/**
+ * @name Producer ID and Epoch for the Idempotent Producer
+ * @{
+ *
+ */
+
+/**
+ * @brief Producer ID and Epoch
+ */
+typedef struct rd_kafka_pid_s {
+        int64_t id;     /**< Producer Id */
+        int16_t epoch;  /**< Producer Epoch */
+} rd_kafka_pid_t;
+
+#define RD_KAFKA_PID_INITIALIZER {-1,-1}
+
+/**
+ * @returns true if \p PID is valid
+ */
+#define rd_kafka_pid_valid(PID) ((PID).id != -1)
+
+/**
+ * @brief Check two pids for equality
+ */
+static RD_UNUSED RD_INLINE int rd_kafka_pid_eq (const rd_kafka_pid_t a,
+                                                const rd_kafka_pid_t b) {
+        return a.id == b.id && a.epoch == b.epoch;
+}
+
+/**
+ * @returns the string representation of a PID in a thread-safe
+ *          static buffer.
+ */
+static RD_UNUSED const char *
+rd_kafka_pid2str (const rd_kafka_pid_t pid) {
+        static RD_TLS char buf[2][64];
+        static RD_TLS int i;
+
+        if (!rd_kafka_pid_valid(pid))
+                return "PID{Invalid}";
+
+        i = (i + 1) % 2;
+
+        rd_snprintf(buf[i], sizeof(buf[i]),
+                    "PID{Id:%"PRId64",Epoch:%hd}", pid.id, pid.epoch);
+
+        return buf[i];
+}
+
+/**
+ * @brief Reset the PID to invalid/init state
+ */
+static RD_UNUSED RD_INLINE void rd_kafka_pid_reset (rd_kafka_pid_t *pid) {
+        pid->id = -1;
+        pid->epoch = -1;
+}
+
+
+/**
+ * @brief Bump the epoch of a valid PID
+ */
+static RD_UNUSED RD_INLINE rd_kafka_pid_t
+rd_kafka_pid_bump (const rd_kafka_pid_t old) {
+        rd_kafka_pid_t new = { old.id, ((int)old.epoch + 1) & (int)INT16_MAX };
+        return new;
+}
+
+/**@}*/
+
+
+#endif /* _RDKAFKA_PROTO_H_ */

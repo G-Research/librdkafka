@@ -71,7 +71,9 @@
 #if WITH_SNAPPY
 #include "snappy.h"
 #endif
-
+#if WITH_ZSTD
+#include "rdkafka_zstd.h"
+#endif
 
 
 struct msgset_v2_hdr {
@@ -117,12 +119,24 @@ typedef struct rd_kafka_msgset_reader_s {
                                           *          reference! */
 
         int          msetr_msgcnt;      /**< Number of messages in rkq */
+        int64_t      msetr_msg_bytes;   /**< Number of bytes in rkq */
         rd_kafka_q_t msetr_rkq;         /**< Temp Message and error queue */
         rd_kafka_q_t *msetr_par_rkq;    /**< Parent message and error queue,
                                          *   the temp msetr_rkq will be moved
                                          *   to this queue when parsing
                                          *   is done.
                                          *   Refcount is not increased. */
+
+        int64_t msetr_next_offset;      /**< Next offset to fetch after
+                                         *   this reader run is done.
+                                         *   Optional: only used for special
+                                         *   cases where the per-message offset
+                                         *   can't be relied on for next
+                                         *   fetch offset, such as with
+                                         *   compacted topics. */
+
+        int msetr_ctrl_cnt;             /**< Number of control messages
+                                         *   or MessageSets received. */
 
         const char *msetr_srcname;      /**< Optional message source string,
                                          *   used in debug logging to
@@ -334,6 +348,19 @@ rd_kafka_msgset_reader_decompress (rd_kafka_msgset_reader_t *msetr,
         }
         break;
 
+#if WITH_ZSTD
+        case RD_KAFKA_COMPRESSION_ZSTD:
+        {
+                err = rd_kafka_zstd_decompress(msetr->msetr_rkb,
+                                              (char *)compressed,
+                                              compressed_size,
+                                              &iov.iov_base, &iov.iov_len);
+                if (err)
+                        goto err;
+        }
+        break;
+#endif
+
         default:
                 rd_rkb_dbg(msetr->msetr_rkb, MSG, "CODEC",
                            "%s [%"PRId32"]: Message at offset %"PRId64
@@ -400,6 +427,7 @@ rd_kafka_msgset_reader_decompress (rd_kafka_msgset_reader_t *msetr,
 
                 /* Transfer message count from inner to outer */
                 msetr->msetr_msgcnt += inner_msetr.msetr_msgcnt;
+                msetr->msetr_msg_bytes += inner_msetr.msetr_msg_bytes;
 
 
         } else {
@@ -607,6 +635,7 @@ rd_kafka_msgset_reader_msg_v0_1 (rd_kafka_msgset_reader_t *msetr) {
         /* Enqueue message on temporary queue */
         rd_kafka_q_enq(&msetr->msetr_rkq, rko);
         msetr->msetr_msgcnt++;
+        msetr->msetr_msg_bytes += rkm->rkm_key_len + rkm->rkm_len;
 
         return RD_KAFKA_RESP_ERR_NO_ERROR; /* Continue */
 
@@ -628,7 +657,7 @@ rd_kafka_msgset_reader_msg_v2 (rd_kafka_msgset_reader_t *msetr) {
         rd_kafka_toppar_t *rktp = msetr->msetr_rktp;
         struct {
                 int64_t Length;
-                int64_t  MsgAttributes; /* int8_t, but int64 req. for varint */
+                int8_t  MsgAttributes;
                 int64_t TimestampDelta;
                 int64_t OffsetDelta;
                 int64_t Offset;  /* Absolute offset */
@@ -645,7 +674,7 @@ rd_kafka_msgset_reader_msg_v2 (rd_kafka_msgset_reader_t *msetr) {
 
         rd_kafka_buf_read_varint(rkbuf, &hdr.Length);
         message_end = rd_slice_offset(&rkbuf->rkbuf_reader)+(size_t)hdr.Length;
-        rd_kafka_buf_read_varint(rkbuf, &hdr.MsgAttributes);
+        rd_kafka_buf_read_i8(rkbuf, &hdr.MsgAttributes);
 
         rd_kafka_buf_read_varint(rkbuf, &hdr.TimestampDelta);
         rd_kafka_buf_read_varint(rkbuf, &hdr.OffsetDelta);
@@ -654,7 +683,10 @@ rd_kafka_msgset_reader_msg_v2 (rd_kafka_msgset_reader_t *msetr) {
         /* Skip message if outdated */
         if (hdr.Offset < rktp->rktp_offsets.fetch_offset) {
                 rd_rkb_dbg(msetr->msetr_rkb, MSG, "MSG",
+                           "%s [%"PRId32"]: "
                            "Skip offset %"PRId64" < fetch_offset %"PRId64,
+                           rktp->rktp_rkt->rkt_topic->str,
+                           rktp->rktp_partition,
                            hdr.Offset, rktp->rktp_offsets.fetch_offset);
                 rd_kafka_buf_skip_to(rkbuf, message_end);
                 return RD_KAFKA_RESP_ERR_NO_ERROR; /* Continue with next msg */
@@ -709,6 +741,7 @@ rd_kafka_msgset_reader_msg_v2 (rd_kafka_msgset_reader_t *msetr) {
         /* Enqueue message on temporary queue */
         rd_kafka_q_enq(&msetr->msetr_rkq, rko);
         msetr->msetr_msgcnt++;
+        msetr->msetr_msg_bytes += rkm->rkm_key_len + rkm->rkm_len;
 
         return RD_KAFKA_RESP_ERR_NO_ERROR;
 
@@ -837,6 +870,7 @@ rd_kafka_msgset_reader_v2 (rd_kafka_msgset_reader_t *msetr) {
 
         /* Ignore control messages */
         if (unlikely((hdr.Attributes & RD_KAFKA_MSGSET_V2_ATTR_CONTROL))) {
+                msetr->msetr_ctrl_cnt++;
                 rd_kafka_buf_skip(rkbuf, payload_size);
                 goto done;
         }
@@ -884,8 +918,7 @@ rd_kafka_msgset_reader_v2 (rd_kafka_msgset_reader_t *msetr) {
          * to avoid getting stuck on compacted MessageSets where the last
          * Message in the MessageSet has an Offset < MessageSet header's
          * last offset.  See KAFKA-5443 */
-        if (likely(LastOffset >= msetr->msetr_rktp->rktp_offsets.fetch_offset))
-                msetr->msetr_rktp->rktp_offsets.fetch_offset = LastOffset + 1;
+        msetr->msetr_next_offset = LastOffset + 1;
 
         msetr->msetr_v2_hdr = NULL;
 
@@ -902,46 +935,44 @@ rd_kafka_msgset_reader_v2 (rd_kafka_msgset_reader_t *msetr) {
 }
 
 
-
 /**
- * @brief Parse and read messages from msgset reader buffer.
+ * @brief Peek into the next MessageSet to find the MsgVersion.
+ *
+ * @param MagicBytep the MsgVersion is returned here on success.
+ *
+ * @returns an error on read underflow or if the MsgVersion is
+ *          unsupported.
  */
 static rd_kafka_resp_err_t
-rd_kafka_msgset_reader (rd_kafka_msgset_reader_t *msetr) {
+rd_kafka_msgset_reader_peek_msg_version (rd_kafka_msgset_reader_t *msetr,
+                                         int8_t *MagicBytep) {
         rd_kafka_buf_t *rkbuf = msetr->msetr_rkbuf;
         rd_kafka_toppar_t *rktp = msetr->msetr_rktp;
-        rd_kafka_resp_err_t (*reader[]) (rd_kafka_msgset_reader_t *) = {
-                /* Indexed by MsgVersion/MagicByte, pointing to
-                 * a Msg(Set)Version reader */
-                [0] = rd_kafka_msgset_reader_msg_v0_1,
-                [1] = rd_kafka_msgset_reader_msg_v0_1,
-                [2] = rd_kafka_msgset_reader_v2
-        };
-        rd_kafka_resp_err_t err;
         /* Only log decoding errors if protocol debugging enabled. */
         int log_decode_errors = (rkbuf->rkbuf_rkb->rkb_rk->rk_conf.debug &
                                  RD_KAFKA_DBG_PROTOCOL) ? LOG_DEBUG : 0;
-        int8_t MagicByte;
         size_t read_offset = rd_slice_offset(&rkbuf->rkbuf_reader);
 
-        /* We dont know the MsgVersion at this point, peek where the
-         * MagicByte resides both in MsgVersion v0..1 and v2 to
-         * know which MessageSet reader to use. */
-        rd_kafka_buf_peek_i8(rkbuf, read_offset+8+4+4, &MagicByte);
+        rd_kafka_buf_peek_i8(rkbuf, read_offset+8+4+4, MagicBytep);
 
-        if (unlikely(MagicByte < 0 || MagicByte > 2)) {
+        if (unlikely(*MagicBytep < 0 || *MagicBytep > 2)) {
                 int64_t Offset; /* For error logging */
-                rd_kafka_buf_peek_i64(rkbuf, read_offset+0, &Offset);
+                int32_t Length;
+
+                rd_kafka_buf_read_i64(rkbuf, &Offset);
 
                 rd_rkb_dbg(msetr->msetr_rkb,
                            MSG | RD_KAFKA_DBG_PROTOCOL | RD_KAFKA_DBG_FETCH,
                            "MAGICBYTE",
                            "%s [%"PRId32"]: "
                            "Unsupported Message(Set) MagicByte %d at "
-                           "offset %"PRId64": skipping",
+                           "offset %"PRId64" "
+                           "(buffer position %"PRIusz"/%"PRIusz"): skipping",
                            rktp->rktp_rkt->rkt_topic->str,
                            rktp->rktp_partition,
-                           (int)MagicByte, Offset);
+                           (int)*MagicBytep, Offset,
+                           read_offset, rd_slice_size(&rkbuf->rkbuf_reader));
+
                 if (Offset >= msetr->msetr_rktp->rktp_offsets.fetch_offset) {
                         rd_kafka_q_op_err(
                                 &msetr->msetr_rkq,
@@ -950,24 +981,71 @@ rd_kafka_msgset_reader (rd_kafka_msgset_reader_t *msetr) {
                                 msetr->msetr_tver->version, rktp, Offset,
                                 "Unsupported Message(Set) MagicByte %d "
                                 "at offset %"PRId64,
-                                (int)MagicByte, Offset);
+                                (int)*MagicBytep, Offset);
                         /* Skip message(set) */
                         msetr->msetr_rktp->rktp_offsets.fetch_offset = Offset+1;
                 }
 
+                /* Skip this Message(Set).
+                 * If the message is malformed, the skip may trigger err_parse
+                 * and return ERR__BAD_MSG. */
+                rd_kafka_buf_read_i32(rkbuf, &Length);
+                rd_kafka_buf_skip(rkbuf, Length);
+
                 return RD_KAFKA_RESP_ERR__NOT_IMPLEMENTED;
         }
 
-        /* Let version-specific reader parse MessageSets until the slice
-         * is exhausted or an error occurs (typically a partial message). */
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+
+ err_parse:
+        return RD_KAFKA_RESP_ERR__BAD_MSG;
+}
+
+
+/**
+ * @brief Parse and read messages from msgset reader buffer.
+ */
+static rd_kafka_resp_err_t
+rd_kafka_msgset_reader (rd_kafka_msgset_reader_t *msetr) {
+        rd_kafka_buf_t *rkbuf = msetr->msetr_rkbuf;
+        rd_kafka_resp_err_t (*reader[])
+                (rd_kafka_msgset_reader_t *) = {
+                /* Indexed by MsgVersion/MagicByte, pointing to
+                 * a Msg(Set)Version reader */
+                [0] = rd_kafka_msgset_reader_msg_v0_1,
+                [1] = rd_kafka_msgset_reader_msg_v0_1,
+                [2] = rd_kafka_msgset_reader_v2
+        };
+        rd_kafka_resp_err_t err;
+
+        /* Parse MessageSets until the slice is exhausted or an
+         * error occurs (typically a partial message). */
         do {
+                int8_t MagicByte;
+
+                /* We dont know the MsgVersion at this point, peek where the
+                 * MagicByte resides both in MsgVersion v0..1 and v2 to
+                 * know which MessageSet reader to use. */
+                err = rd_kafka_msgset_reader_peek_msg_version(msetr,
+                                                              &MagicByte);
+                if (unlikely(err)) {
+                        if (err == RD_KAFKA_RESP_ERR__BAD_MSG)
+                                /* Read underflow, not an error.
+                                 * Broker may return a partial Fetch response
+                                 * due to its use of sendfile(2). */
+                                return RD_KAFKA_RESP_ERR_NO_ERROR;
+
+                        /* Continue on unsupported MsgVersions, the
+                         * MessageSet will be skipped. */
+                        continue;
+                }
+
+                /* Use MsgVersion-specific reader */
                 err = reader[(int)MagicByte](msetr);
+
         } while (!err && rd_slice_remains(&rkbuf->rkbuf_reader) > 0);
 
         return err;
-
- err_parse:
-        return RD_KAFKA_RESP_ERR_NO_ERROR;
 }
 
 
@@ -1028,8 +1106,13 @@ rd_kafka_msgset_reader_run (rd_kafka_msgset_reader_t *msetr) {
                 /* The message set didn't contain at least one full message
                  * or no error was posted on the response queue.
                  * This means the size limit perhaps was too tight,
-                 * increase it automatically. */
-                if (rktp->rktp_fetch_msg_max_bytes < (1 << 30)) {
+                 * increase it automatically.
+                 * If there was at least one control message there
+                 * is probably not a size limit and nothing is done. */
+                if (msetr->msetr_ctrl_cnt > 0) {
+                        /* Noop */
+
+                } else  if (rktp->rktp_fetch_msg_max_bytes < (1 << 30)) {
                         rktp->rktp_fetch_msg_max_bytes *= 2;
                         rd_rkb_dbg(msetr->msetr_rkb, FETCH, "CONSUME",
                                    "Topic %s [%"PRId32"]: Increasing "
@@ -1064,13 +1147,17 @@ rd_kafka_msgset_reader_run (rd_kafka_msgset_reader_t *msetr) {
         }
 
         rd_rkb_dbg(msetr->msetr_rkb, MSG | RD_KAFKA_DBG_FETCH, "CONSUME",
-                   "Enqueue %i %smessage(s) (%d ops) on %s [%"PRId32"] "
-                   "fetch queue (qlen %d, v%d, last_offset %"PRId64")",
+                   "Enqueue %i %smessage(s) (%"PRId64" bytes, %d ops) on "
+                   "%s [%"PRId32"] "
+                   "fetch queue (qlen %d, v%d, last_offset %"PRId64
+                   ", %d ctrl msgs)",
                    msetr->msetr_msgcnt, msetr->msetr_srcname,
+                   msetr->msetr_msg_bytes,
                    rd_kafka_q_len(&msetr->msetr_rkq),
                    rktp->rktp_rkt->rkt_topic->str,
                    rktp->rktp_partition, rd_kafka_q_len(&msetr->msetr_rkq),
-                   msetr->msetr_tver->version, last_offset);
+                   msetr->msetr_tver->version, last_offset,
+                   msetr->msetr_ctrl_cnt);
 
         /* Concat all messages&errors onto the parent's queue
          * (the partition's fetch queue) */
@@ -1080,6 +1167,11 @@ rd_kafka_msgset_reader_run (rd_kafka_msgset_reader_t *msetr) {
                 if (likely(last_offset != -1))
                         rktp->rktp_offsets.fetch_offset = last_offset + 1;
         }
+
+        /* Adjust next fetch offset if outlier code has indicated
+         * an even later next offset. */
+        if (msetr->msetr_next_offset > rktp->rktp_offsets.fetch_offset)
+                rktp->rktp_offsets.fetch_offset = msetr->msetr_next_offset;
 
         rd_kafka_q_destroy_owner(&msetr->msetr_rkq);
 
@@ -1113,10 +1205,14 @@ rd_kafka_msgset_parse (rd_kafka_buf_t *rkbuf,
         /* Parse and handle the message set */
         err = rd_kafka_msgset_reader_run(&msetr);
 
-        rd_atomic64_add(&rktp->rktp_c.msgs, msetr.msetr_msgcnt);
+        rd_atomic64_add(&rktp->rktp_c.rx_msgs, msetr.msetr_msgcnt);
+        rd_atomic64_add(&rktp->rktp_c.rx_msg_bytes, msetr.msetr_msg_bytes);
+
+        rd_avg_add(&rktp->rktp_rkt->rkt_avg_batchcnt,
+                   (int64_t)msetr.msetr_msgcnt);
+        rd_avg_add(&rktp->rktp_rkt->rkt_avg_batchsize,
+                   (int64_t)msetr.msetr_msg_bytes);
 
         return err;
 
 }
-
-

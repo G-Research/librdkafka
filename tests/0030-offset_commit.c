@@ -81,7 +81,7 @@ static void offset_commit_cb (rd_kafka_t *rk, rd_kafka_resp_err_t err,
                           "should be above committed_offset %"PRId64,
                           rktpar->offset, committed_offset);
         else if (rktpar->offset == committed_offset)
-                TEST_SAYL(1, "Current offset re-commited: %"PRId64"\n",
+                TEST_SAYL(1, "Current offset re-committed: %"PRId64"\n",
                           rktpar->offset);
         else
                 committed_offset = rktpar->offset;
@@ -158,10 +158,7 @@ static void do_offset_test (const char *what, int auto_commit, int auto_store,
 
 		if (rkm->err == RD_KAFKA_RESP_ERR__TIMED_OUT)
 			TEST_FAIL("%s: Timed out waiting for message %d", what,cnt);
-		else if (rkm->err == RD_KAFKA_RESP_ERR__PARTITION_EOF) {
-			rd_kafka_message_destroy(rkm);
-			continue;
-		} else if (rkm->err)
+                else if (rkm->err)
 			TEST_FAIL("%s: Consumer error: %s",
 				  what, rd_kafka_message_errstr(rkm));
 
@@ -306,10 +303,7 @@ static void do_offset_test (const char *what, int auto_commit, int auto_store,
 
 		if (rkm->err == RD_KAFKA_RESP_ERR__TIMED_OUT)
 			TEST_FAIL("%s: Timed out waiting for message %d", what,cnt);
-		else if (rkm->err == RD_KAFKA_RESP_ERR__PARTITION_EOF) {
-			rd_kafka_message_destroy(rkm);
-			continue;
-		} else if (rkm->err)
+                else if (rkm->err)
 			TEST_FAIL("%s: Consumer error: %s",
 				  what, rd_kafka_message_errstr(rkm));
 

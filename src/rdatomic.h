@@ -25,7 +25,8 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#pragma once
+#ifndef _RDATOMIC_H_
+#define _RDATOMIC_H_
 
 #include "tinycthread.h"
 
@@ -109,6 +110,12 @@ static RD_INLINE int32_t RD_UNUSED rd_atomic32_set(rd_atomic32_t *ra, int32_t v)
 	r = ra->val = v;
 	mtx_unlock(&ra->lock);
 	return r;
+#elif HAVE_ATOMICS_32_ATOMIC
+        __atomic_store_n(&ra->val, v, __ATOMIC_SEQ_CST);
+        return v;
+#elif HAVE_ATOMICS_32_SYNC
+        (void)__sync_lock_test_and_set(&ra->val, v);
+        return v;
 #else
 	return ra->val = v; // FIXME
 #endif
@@ -182,7 +189,15 @@ static RD_INLINE int64_t RD_UNUSED rd_atomic64_set(rd_atomic64_t *ra, int64_t v)
 	r = ra->val;
 	mtx_unlock(&ra->lock);
 	return r;
+#elif HAVE_ATOMICS_64_ATOMIC
+        __atomic_store_n(&ra->val, v, __ATOMIC_SEQ_CST);
+        return v;
+#elif HAVE_ATOMICS_64_SYNC
+        (void)__sync_lock_test_and_set(&ra->val, v);
+        return v;
 #else
 	return ra->val = v; // FIXME
 #endif
 }
+
+#endif /* _RDATOMIC_H_ */

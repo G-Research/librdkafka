@@ -35,12 +35,18 @@ class LibrdkafkaTestApp(App):
         f, self.test_conf_file = self.open_file('test.conf', 'perm')
         f.write('broker.address.family=v4\n'.encode('ascii'))
         f.write(('test.sql.command=sqlite3 rdktests\n').encode('ascii'))
-        f.write(('\n'.join(conf_blob)).encode('ascii'))
+        f.write('test.timeout.multiplier=2\n'.encode('ascii'))
 
-        if version == 'trunk' or version.startswith('0.10.'):
-            conf_blob.append('api.version.request=true')
-        else:
+        sparse = conf.get('sparse_connections', None)
+        if sparse is not None:
+            f.write('enable.sparse.connections={}\n'.format(sparse).encode('ascii'))
+
+        if version.startswith('0.9') or version.startswith('0.8'):
+            conf_blob.append('api.version.request=false')
             conf_blob.append('broker.version.fallback=%s' % version)
+        else:
+            conf_blob.append('broker.version.fallback=0.10.0.0') # any broker version with ApiVersion support
+            conf_blob.append('api.version.fallback.ms=0')
 
         # SASL (only one mechanism supported at a time)
         mech = self.conf.get('sasl_mechanisms', '').split(',')[0]
@@ -97,6 +103,8 @@ class LibrdkafkaTestApp(App):
             bootstrap_servers = all_listeners[0]
             self.log('WARNING: No eligible listeners for security.protocol=%s in %s: falling back to first listener: %s: tests will fail (which might be the intention)' % (security_protocol, all_listeners, bootstrap_servers))
 
+        self.bootstrap_servers = bootstrap_servers
+
         conf_blob.append('bootstrap.servers=%s' % bootstrap_servers)
         conf_blob.append('security.protocol=%s' % security_protocol)
 
@@ -105,6 +113,7 @@ class LibrdkafkaTestApp(App):
 
         self.env_add('RDKAFKA_TEST_CONF', self.test_conf_file)
         self.env_add('TEST_KAFKA_VERSION', version)
+        self.env_add('TRIVUP_ROOT', cluster.instance_path())
 
         if self.test_mode != 'bash':
             self.test_report_file = self.mkpath('test_report', pathtype='perm')
@@ -114,10 +123,17 @@ class LibrdkafkaTestApp(App):
                 self.env_add('TESTS', ','.join(tests))
 
     def start_cmd (self):
+        self.env_add('KAFKA_PATH', self.cluster.get_all('destdir', '', KafkaBrokerApp)[0], False)
+        self.env_add('ZK_ADDRESS', self.cluster.get_all('address', '', ZookeeperApp)[0], False)
+        self.env_add('BROKERS', self.cluster.bootstrap_servers(), False)
+
         extra_args = list()
         if not self.local_tests:
             extra_args.append('-L')
-        return './run-test.sh -p5 -K %s ./merged %s' % (' '.join(extra_args), self.test_mode)
+        if self.conf.get('args', None) is not None:
+            extra_args.append(self.conf.get('args'))
+        extra_args.append('-E')
+        return './run-test.sh -p%d -K %s ./merged %s' % (int(self.conf.get('parallel', 5)), ' '.join(extra_args), self.test_mode)
 
 
     def report (self):

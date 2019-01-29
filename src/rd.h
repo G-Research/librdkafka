@@ -27,8 +27,8 @@
  */
 
 
-
-#pragma once
+#ifndef _RD_H_
+#define _RD_H_
 
 #ifndef _MSC_VER
 #ifndef _GNU_SOURCE
@@ -80,7 +80,7 @@
 
 
 /** Assert if reached */
-#define RD_NOTREACHED() rd_kafka_assert(NULL, !*"/* NOTREACHED */ violated")
+#define RD_NOTREACHED() rd_assert(!*"/* NOTREACHED */ violated")
 
 
 
@@ -144,22 +144,32 @@ static RD_INLINE RD_UNUSED char *rd_strndup(const char *s, size_t len) {
 #ifdef strndupa
 #define rd_strndupa(DESTPTR,PTR,LEN)  (*(DESTPTR) = strndupa(PTR,LEN))
 #else
-#define rd_strndupa(DESTPTR,PTR,LEN) (*(DESTPTR) = rd_alloca(LEN+1), \
-      memcpy(*(DESTPTR), (PTR), LEN), *((*(DESTPTR))+(LEN)) = 0)
+#define rd_strndupa(DESTPTR,PTR,LEN) do {                               \
+                const char *_src = (PTR);                               \
+                size_t _srclen = (LEN);                                 \
+                char *_dst = rd_alloca(_srclen + 1);                    \
+                memcpy(_dst, _src, _srclen);                            \
+                _dst[_srclen] = '\0';                                   \
+                *(DESTPTR) = _dst;                                      \
+        } while (0)
 #endif
 
 #ifdef strdupa
 #define rd_strdupa(DESTPTR,PTR)  (*(DESTPTR) = strdupa(PTR))
 #else
-#define rd_strdupa(DESTPTR,PTR)  rd_strndupa(DESTPTR,PTR,strlen(PTR))
+#define rd_strdupa(DESTPTR,PTR) do {                                    \
+                const char *_src1 = (PTR);                              \
+                size_t _srclen1 = strlen(_src1);                        \
+                rd_strndupa(DESTPTR, _src1, _srclen1);                  \
+        } while (0)
 #endif
 
 #ifndef IOV_MAX
 #ifdef __APPLE__
 /* Some versions of MacOSX dont have IOV_MAX */
 #define IOV_MAX 1024
-#elif defined(_MSC_VER)
-/* There is no IOV_MAX on MSVC but it is used internally in librdkafka */
+#elif defined(_MSC_VER) || defined(__GNU__)
+/* There is no IOV_MAX on MSVC or GNU but it is used internally in librdkafka */
 #define IOV_MAX 1024
 #else
 #error "IOV_MAX not defined"
@@ -220,8 +230,8 @@ static RD_INLINE RD_UNUSED void *rd_memdup (const void *src, size_t size) {
 /**
  * Generic refcnt interface
  */
-#ifndef _MSC_VER
-/* Mutexes (critical sections) are slow, even when uncontended, on Windows */
+
+#if !HAVE_ATOMICS_32
 #define RD_REFCNT_USE_LOCKS 1
 #endif
 
@@ -453,3 +463,5 @@ typedef struct rd_chariov_s {
         char  *ptr;
         size_t size;
 } rd_chariov_t;
+
+#endif /* _RD_H_ */

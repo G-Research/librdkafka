@@ -6,13 +6,11 @@
     <RootNamespace>tests</RootNamespace>
     <WindowsTargetPlatformVersion>8.1</WindowsTargetPlatformVersion>
   </PropertyGroup>
-  <Import Project="$(SolutionDir)common.vcxproj"/>
+  <Import Project="$(SolutionDir)common.vcxproj" />
   <PropertyGroup Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
   </PropertyGroup>
-  <PropertyGroup Label="UserMacros">
-    <NuGetPackageImportStamp>8e214174</NuGetPackageImportStamp>
-  </PropertyGroup>
+  <PropertyGroup Label="UserMacros" />
   <ItemDefinitionGroup>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -134,6 +132,7 @@
     <ClCompile Include="..\..\tests\0046-rkt_cache.c" />
     <ClCompile Include="..\..\tests\0047-partial_buf_tmout.c" />
     <ClCompile Include="..\..\tests\0048-partitioner.c" />
+    <ClCompile Include="..\..\tests\0049-consume_conn_close.c" />
     <ClCompile Include="..\..\tests\0050-subscribe_adds.c" />
     <ClCompile Include="..\..\tests\0051-assign_adds.c" />
     <ClCompile Include="..\..\tests\0052-msg_timestamps.c" />
@@ -158,10 +157,29 @@
     <ClCompile Include="..\..\tests\0072-headers_ut.c" />
     <ClCompile Include="..\..\tests\0073-headers.c" />
     <ClCompile Include="..\..\tests\0074-producev.c" />
+    <ClCompile Include="..\..\tests\0075-retry.c" />
+    <ClCompile Include="..\..\tests\0076-produce_retry.c" />
+    <ClCompile Include="..\..\tests\0077-compaction.c" />
+    <ClCompile Include="..\..\tests\0078-c_from_cpp.cpp" />
+    <ClCompile Include="..\..\tests\0079-fork.c" />
+    <ClCompile Include="..\..\tests\0080-admin_ut.c" />
+    <ClCompile Include="..\..\tests\0081-admin.c" />
+    <ClCompile Include="..\..\tests\0082-fetch_max_bytes.cpp" />
+    <ClCompile Include="..\..\tests\0083-cb_event.c" />
+    <ClCompile Include="..\..\tests\0084-destroy_flags.c" />
+    <ClCompile Include="..\..\tests\0085-headers.cpp" />
+    <ClCompile Include="..\..\tests\0086-purge.c" />
+    <ClCompile Include="..\..\tests\0088-produce_metadata_timeout.c" />
+    <ClCompile Include="..\..\tests\0089-max_poll_interval.c" />
+    <ClCompile Include="..\..\tests\0090-idempotence.c" />
+    <ClCompile Include="..\..\tests\0091-max_poll_interval_timeout.c" />
+    <ClCompile Include="..\..\tests\0092-mixed_msgver.c" />
+    <ClCompile Include="..\..\tests\0093-holb.c" />
     <ClCompile Include="..\..\tests\8000-idle.cpp" />
     <ClCompile Include="..\..\tests\test.c" />
     <ClCompile Include="..\..\tests\testcpp.cpp" />
     <ClCompile Include="..\..\src\tinycthread.c" />
+    <ClCompile Include="..\..\src\tinycthread_extra.c" />
     <ClCompile Include="..\..\src\rdlist.c" />
   </ItemGroup>
   <ItemGroup>

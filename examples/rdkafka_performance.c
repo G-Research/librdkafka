@@ -68,7 +68,6 @@ static FILE *stats_fp;
 static int dr_disp_div;
 static int verbosity = 1;
 static int latency_mode = 0;
-static int report_offset = 0;
 static FILE *latency_fp = NULL;
 static int msgcnt = -1;
 static int incremental_mode = 0;
@@ -131,8 +130,15 @@ uint64_t wall_clock (void) {
 }
 
 static void err_cb (rd_kafka_t *rk, int err, const char *reason, void *opaque) {
-	printf("%% ERROR CALLBACK: %s: %s: %s\n",
-	       rd_kafka_name(rk), rd_kafka_err2str(err), reason);
+        if (err == RD_KAFKA_RESP_ERR__FATAL) {
+                char errstr[512];
+                err = rd_kafka_fatal_error(rk, errstr, sizeof(errstr));
+                printf("%% FATAL ERROR CALLBACK: %s: %s: %s\n",
+                       rd_kafka_name(rk), rd_kafka_err2str(err), errstr);
+        } else {
+                printf("%% ERROR CALLBACK: %s: %s: %s\n",
+                       rd_kafka_name(rk), rd_kafka_err2str(err), reason);
+        }
 }
 
 static void throttle_cb (rd_kafka_t *rk, const char *broker_name,
@@ -227,8 +233,7 @@ static void msg_delivered (rd_kafka_t *rk,
 		last = now;
 	}
 
-        if (report_offset)
-                cnt.last_offset = rkmessage->offset;
+        cnt.last_offset = rkmessage->offset;
 
 	if (msgs_wait_produce_cnt == 0 && msgs_wait_cnt == 0 && !forever) {
 		if (verbosity >= 2)
@@ -502,8 +507,7 @@ static void print_stats (rd_kafka_t *rk,
                                 COL_HDR("dr_err");
                                 COL_HDR("tx_err");
                                 COL_HDR("outq");
-                                if (report_offset)
-                                        COL_HDR("offset");
+                                COL_HDR("offset");
                                 if (latency_mode) {
                                         COL_HDR("lat_curr");
                                         COL_HDR("lat_avg");
@@ -528,8 +532,7 @@ static void print_stats (rd_kafka_t *rk,
                         COL_PR64("tx_err", cnt.tx_err);
                         COL_PR64("outq",
                                  rk ? (uint64_t)rd_kafka_outq_len(rk) : 0);
-                        if (report_offset)
-                                COL_PR64("offset", (uint64_t)cnt.last_offset);
+                        COL_PR64("offset", (uint64_t)cnt.last_offset);
                         if (latency_mode) {
                                 COL_PRF("lat_curr", cnt.latency_last / 1000.0f);
                                 COL_PRF("lat_avg", latency_avg / 1000.0f);
@@ -754,11 +757,28 @@ static rd_kafka_resp_err_t do_produce (rd_kafka_t *rk,
 
         } else {
                 if (rd_kafka_produce(rkt, partition, msgflags, payload, size,
-                                     key, key_size, NULL) == 1)
+                                     key, key_size, NULL) == -1)
                         return rd_kafka_last_error();
         }
 
         return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+/**
+ * @brief Sleep for \p sleep_us microseconds.
+ */
+static void do_sleep (int sleep_us) {
+        if (sleep_us > 100) {
+#ifdef _MSC_VER
+                Sleep(sleep_us / 1000);
+#else
+                usleep(sleep_us);
+#endif
+        } else {
+                rd_ts_t next = rd_clock() + (rd_ts_t)sleep_us;
+                while (next > rd_clock())
+                        ;
+        }
 }
 
 
@@ -771,8 +791,9 @@ int main (int argc, char **argv) {
 	int opt;
 	int sendflags = 0;
 	char *msgpattern = "librdkafka_performance testing!";
-	int msgsize = (int)strlen(msgpattern);
+	int msgsize = -1;
 	const char *debug = NULL;
+	int do_conf_dump = 0;
 	rd_ts_t now;
 	char errstr[512];
 	uint64_t seq = 0;
@@ -978,6 +999,11 @@ int main (int argc, char **argv) {
 				exit(0);
 			}
 
+			if (!strcmp(optarg, "dump")) {
+				do_conf_dump = 1;
+				continue;
+			}
+
 			name = optarg;
 			if (!(val = strchr(name, '='))) {
 				fprintf(stderr, "%% Expected "
@@ -1066,18 +1092,6 @@ int main (int argc, char **argv) {
 			}
                         break;
 
-                case 'O':
-                        if (rd_kafka_topic_conf_set(topic_conf,
-                                                    "produce.offset.report",
-                                                    "true",
-                                                    errstr, sizeof(errstr)) !=
-                            RD_KAFKA_CONF_OK) {
-                                fprintf(stderr, "%% %s\n", errstr);
-                                exit(1);
-                        }
-                        report_offset = 1;
-                        break;
-
 		case 'M':
 			incremental_mode = 1;
 			break;
@@ -1135,9 +1149,9 @@ int main (int argc, char **argv) {
 			"configuration property\n"
 			"               Properties prefixed with \"topic.\" "
 			"will be set on topic object.\n"
-			"               Use '-X list' to see the full list\n"
-			"               of supported properties.\n"
                         "  -X file=<path> Read config from file.\n"
+                        "  -X list      Show full list of supported properties.\n"
+                        "  -X dump      Show configuration\n"
 			"  -T <intvl>   Enable statistics from librdkafka at "
 			"specified interval (ms)\n"
                         "  -Y <command> Pipe statistics to <command>\n"
@@ -1209,6 +1223,35 @@ int main (int argc, char **argv) {
                 exit(1);
         }
 
+        if (do_conf_dump) {
+                const char **arr;
+                size_t cnt;
+                int pass;
+
+                for (pass = 0 ; pass < 2 ; pass++) {
+                        int i;
+
+                        if (pass == 0) {
+                                arr = rd_kafka_conf_dump(conf, &cnt);
+                                printf("# Global config\n");
+                        } else {
+                                printf("# Topic config\n");
+                                arr = rd_kafka_topic_conf_dump(topic_conf,
+                                                               &cnt);
+                        }
+
+                        for (i = 0 ; i < (int)cnt ; i += 2)
+                                printf("%s = %s\n",
+                                       arr[i], arr[i+1]);
+
+                        printf("\n");
+
+                        rd_kafka_conf_dump_free(arr, cnt);
+                }
+
+                exit(0);
+        }
+
         if (latency_mode)
                 do_seq = 0;
 
@@ -1231,7 +1274,14 @@ int main (int argc, char **argv) {
 	if (msgcnt != -1)
 		forever = 0;
 
+	if (msgsize == -1)
+		msgsize = (int)strlen(msgpattern);
+
 	topic = topics->elems[0].topic;
+
+        if (mode == 'C' || mode == 'G')
+                rd_kafka_conf_set(conf, "enable.partition.eof", "true",
+                                  NULL, 0);
 
 	if (mode == 'P') {
 		/*
@@ -1383,22 +1433,17 @@ int main (int argc, char **argv) {
 			cnt.msgs++;
 			cnt.bytes += msgsize;
 
-                        if (rate_sleep) {
-				if (rate_sleep > 100) {
-#ifdef _MSC_VER
-					Sleep(rate_sleep / 1000);
-#else
-					usleep(rate_sleep);
-#endif
-				} else {
-					rd_ts_t next = rd_clock() + rate_sleep;
-					while (next > rd_clock())
-						;
-				}
-                        }
-
 			/* Must poll to handle delivery reports */
-			rd_kafka_poll(rk, 0);
+			if (rate_sleep) {
+				rd_ts_t next = rd_clock() + (rd_ts_t) rate_sleep;
+				do {
+					rd_kafka_poll(rk,
+						      (int)RD_MAX(0,
+						      (next - rd_clock()) / 1000));
+				} while (next > rd_clock());
+			} else {
+				rd_kafka_poll(rk, 0);
+			}
 
 			print_stats(rk, mode, otype, compression);
 		}
@@ -1417,9 +1462,6 @@ int main (int argc, char **argv) {
 		outq = rd_kafka_outq_len(rk);
                 if (verbosity >= 2)
                         printf("%% %i messages in outq\n", outq);
-		cnt.msgs -= outq;
-		cnt.bytes -= msgsize * outq;
-
 		cnt.t_end = t_end;
 
 		if (cnt.tx_err > 0)
@@ -1523,6 +1565,12 @@ int main (int argc, char **argv) {
                         if (r == -1)
                                 fprintf(stderr, "%% Error: %s\n",
                                         rd_kafka_err2str(rd_kafka_last_error()));
+                        else if (r > 0 && rate_sleep) {
+                                /* Simulate processing time
+                                 * if `-r <rate>` was set. */
+                                do_sleep(rate_sleep);
+                        }
+
 
 			print_stats(rk, mode, otype, compression);
 
@@ -1604,6 +1652,11 @@ int main (int argc, char **argv) {
 			if (rkmessage) {
 				msg_consume(rkmessage, NULL);
 				rd_kafka_message_destroy(rkmessage);
+
+                                /* Simulate processing time
+                                 * if `-r <rate>` was set. */
+                                if (rate_sleep)
+                                        do_sleep(rate_sleep);
 			}
 
 			cnt.t_fetch_latency += rd_clock() - fetch_latency;

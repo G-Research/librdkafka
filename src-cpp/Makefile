@@ -5,7 +5,7 @@ LIBVER=		1
 CXXSRCS=	RdKafka.cpp ConfImpl.cpp HandleImpl.cpp \
 		ConsumerImpl.cpp ProducerImpl.cpp KafkaConsumerImpl.cpp \
 		TopicImpl.cpp TopicPartitionImpl.cpp MessageImpl.cpp \
-		QueueImpl.cpp MetadataImpl.cpp
+		HeadersImpl.cpp QueueImpl.cpp MetadataImpl.cpp
 
 HDRS=		rdkafkacpp.h
 
@@ -43,16 +43,8 @@ file-check: lib
 check: file-check
 
 install: lib-install
+uninstall: lib-uninstall
 
 clean: lib-clean
-
-ifeq ($(WITH_LDS),y)
-# Enable linker script if supported by platform
-LIB_LDFLAGS+= $(LDFLAG_LINKERSCRIPT)$(LIBNAME).lds
-endif
-
-$(LIBNAME).lds: $(HDRS)
-	@(printf "$(MKL_YELLOW)Generating linker script $@ from $(HDRS)$(MKL_CLR_RESET)\n" ; \
-	  cat ../src/rdkafka.h | ../lds-gen.py > $@)
 
 -include $(DEPS)

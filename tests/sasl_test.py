@@ -12,7 +12,6 @@ from cluster_testing import LibrdkafkaTestCluster, print_report_summary, print_t
 from LibrdkafkaTestApp import LibrdkafkaTestApp
 
 
-import subprocess
 import time
 import tempfile
 import os
@@ -26,7 +25,7 @@ def test_it (version, deploy=True, conf={}, rdkconf={}, tests=None, debug=False)
     @brief Create, deploy and start a Kafka cluster using Kafka \p version
     Then run librdkafka's regression tests.
     """
-    
+
     cluster = LibrdkafkaTestCluster(version, conf, debug=debug)
 
     # librdkafka's regression tests, as an App.
@@ -43,7 +42,7 @@ def test_it (version, deploy=True, conf={}, rdkconf={}, tests=None, debug=False)
     rdkafka.start()
     print('# librdkafka regression tests started, logs in %s' % rdkafka.root_path())
     try:
-        rdkafka.wait_stopped(timeout=60*10)
+        rdkafka.wait_stopped(timeout=60*30)
         rdkafka.dbg('wait stopped: %s, runtime %ds' % (rdkafka.state, rdkafka.runtime()))
     except KeyboardInterrupt:
         print('# Aborted by user')
@@ -162,6 +161,7 @@ if __name__ == '__main__':
                'run': (args.sasl and args.plaintext),
                'conf': sasl_plain_conf,
                'rdkconf': {'sasl_users': 'wrongjoe=mypassword'},
+               'tests': ['0001'],
                'expect_fail': ['all']},
               {'name': 'SASL Kerberos',
                'run': args.sasl,
@@ -195,10 +195,14 @@ if __name__ == '__main__':
             if mech is not None and mech not in supported:
                 print('# Disabled SASL for broker version %s' % version)
                 _conf.pop('sasl_mechanisms', None)
-                
+
             # Run tests
             print('#### Version %s, suite %s: STARTING' % (version, suite['name']))
-            report = test_it(version, tests=tests, conf=_conf, rdkconf=_rdkconf,
+            if tests is None:
+                tests_to_run = suite.get('tests', None)
+            else:
+                tests_to_run = tests
+            report = test_it(version, tests=tests_to_run, conf=_conf, rdkconf=_rdkconf,
                              debug=args.debug)
 
             # Handle test report
@@ -206,7 +210,7 @@ if __name__ == '__main__':
             passed,reason = handle_report(report, version, suite)
             report['PASSED'] = passed
             report['REASON'] = reason
-            
+
             if passed:
                 print('\033[42m#### Version %s, suite %s: PASSED: %s\033[0m' %
                       (version, suite['name'], reason))

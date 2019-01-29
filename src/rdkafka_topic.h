@@ -26,7 +26,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#pragma once
+#ifndef _RDKAFKA_TOPIC_H_
+#define _RDKAFKA_TOPIC_H_
 
 #include "rdlist.h"
 
@@ -72,6 +73,9 @@ struct rd_kafka_itopic_s {
                                                * for at least one partition. */
 
 	rd_kafka_t       *rkt_rk;
+
+        rd_avg_t          rkt_avg_batchsize; /**< Average batch size */
+        rd_avg_t          rkt_avg_batchcnt;  /**< Average batch message count */
 
         shptr_rd_kafka_itopic_t *rkt_shptr_app; /* Application's topic_new() */
 
@@ -183,3 +187,5 @@ void rd_kafka_topic_leader_query0 (rd_kafka_t *rk, rd_kafka_itopic_t *rkt,
         rd_kafka_metadata_fast_leader_query(rk)
 
 void rd_kafka_local_topics_to_list (rd_kafka_t *rk, rd_list_t *topics);
+
+#endif /* _RDKAFKA_TOPIC_H_ */

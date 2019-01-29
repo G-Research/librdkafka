@@ -9,7 +9,7 @@ License: BSD-2-Clause
 URL:     https://github.com/edenhill/librdkafka
 Source:	 librdkafka-%{version}.tar.gz
 
-BuildRequires: zlib-devel libstdc++-devel gcc >= 4.1 gcc-c++ openssl-devel cyrus-sasl-devel lz4-devel python
+BuildRequires: zlib-devel libstdc++-devel gcc >= 4.1 gcc-c++ openssl-devel cyrus-sasl-devel python
 BuildRoot: %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
 %define _source_payload w9.gzdio
@@ -69,8 +69,8 @@ rm -rf %{buildroot}
 %{_libdir}/librdkafka.so.%{soname}
 %{_libdir}/librdkafka++.so.%{soname}
 %defattr(-,root,root)
-%doc README.md CONFIGURATION.md INTRODUCTION.md
-%doc LICENSE LICENSE.pycrc LICENSE.queue LICENSE.snappy LICENSE.tinycthread LICENSE.wingetopt
+%doc README.md CONFIGURATION.md INTRODUCTION.md STATISTICS.md
+%doc LICENSE LICENSES.txt
 
 %defattr(-,root,root)
 #%{_bindir}/rdkafka_example
@@ -87,7 +87,8 @@ rm -rf %{buildroot}
 %{_libdir}/librdkafka++.so
 %{_libdir}/pkgconfig/rdkafka++.pc
 %{_libdir}/pkgconfig/rdkafka.pc
-
+%{_libdir}/pkgconfig/rdkafka-static.pc
+%{_libdir}/pkgconfig/rdkafka++-static.pc
 
 %changelog
 * Thu Apr 09 2015 Eduard Iskandarov <e.iskandarov@corp.mail.ru> 0.8.6-0

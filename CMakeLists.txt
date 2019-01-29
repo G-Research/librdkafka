@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.2)
-project(RdKafka)
+
+include("packaging/cmake/parseversion.cmake")
+parseversion("src/rdkafka.h")
+
+project(RdKafka VERSION ${RDKAFKA_VERSION})
 
 # Options. No 'RDKAFKA_' prefix to match old C++ code. {
 
@@ -22,6 +26,20 @@ else()
   set(with_zlib_default OFF)
 endif()
 option(WITH_ZLIB "With ZLIB" ${with_zlib_default})
+# }
+
+# ZSTD {
+if (WITH_BUNDLED_ZSTD)
+  set(with_zstd_default ON)
+else ()
+  find_library (ZSTD zstd)
+  if(ZSTD)
+    set(with_zstd_default ON)
+  else()
+    set(with_zstd_default OFF)
+  endif()
+endif()
+option(WITH_ZSTD "With ZSTD" ${with_zstd_default})
 # }
 
 # LibDL {
@@ -92,9 +110,12 @@ endif()
 
 # }
 
+option(RDKAFKA_BUILD_STATIC "Build static rdkafka library" OFF)
 option(RDKAFKA_BUILD_EXAMPLES "Build examples" ON)
 option(RDKAFKA_BUILD_TESTS "Build tests" ON)
-
+if(WIN32)
+    option(WITHOUT_WIN32_CONFIG "Avoid including win32_config.h on cmake builds" ON)
+endif(WIN32)
 
 # In:
 # * TRYCOMPILE_SRC_DIR
