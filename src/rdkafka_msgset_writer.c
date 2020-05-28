@@ -44,6 +44,10 @@
 #include "crc32c.h"
 
 
+/** @brief The maxium ProduceRequestion ApiVersion supported by librdkafka */
+static const int16_t rd_kafka_ProduceRequest_max_version = 7;
+
+
 typedef struct rd_kafka_msgset_writer_s {
         rd_kafka_buf_t *msetw_rkbuf;     /* Backing store buffer (refcounted)*/
 
@@ -70,23 +74,14 @@ typedef struct rd_kafka_msgset_writer_s {
         int64_t msetw_MaxTimestamp;      /* Maximum timestamp in batch */
         size_t  msetw_of_CRC;            /* offset of MessageSet.CRC */
 
+        rd_kafka_msgbatch_t *msetw_batch; /**< Convenience pointer to
+                                           *   rkbuf_u.Produce.batch */
+
         /* First message information */
         struct {
                 size_t     of;  /* rkbuf's first message position */
                 int64_t    timestamp;
-                uint64_t   msgid;  /**< Internal/original message id. */
-                int32_t    seq;    /**< Epoch's sequence after adjusting
-                                    *   for current epoch and wrapping. */
         } msetw_firstmsg;
-
-        struct {
-                uint64_t msgid;    /**< Last message to add to batch.
-                                    *   This is used when reconstructing
-                                    *   batches for resends with
-                                    *   the idempotent producer which
-                                    *   require retries to have the
-                                    *   exact same messages in them. */
-        } msetw_lastmsg;
 
         rd_kafka_pid_t msetw_pid;        /**< Idempotent producer's
                                           *   current Producer Id */
@@ -94,6 +89,7 @@ typedef struct rd_kafka_msgset_writer_s {
                                           *          reference! */
         rd_kafka_toppar_t *msetw_rktp;   /* @warning Not a refcounted
                                           *          reference! */
+        rd_kafka_msgq_t *msetw_msgq;     /**< Input message queue */
 } rd_kafka_msgset_writer_t;
 
 
@@ -102,12 +98,14 @@ typedef struct rd_kafka_msgset_writer_s {
  * @brief Select ApiVersion and MsgVersion to use based on broker's
  *        feature compatibility.
  *
+ * @returns -1 if a MsgVersion (or ApiVersion) could not be selected, else 0.
  * @locality broker thread
  */
-static RD_INLINE void
+static RD_INLINE int
 rd_kafka_msgset_writer_select_MsgVersion (rd_kafka_msgset_writer_t *msetw) {
         rd_kafka_broker_t *rkb = msetw->msetw_rkb;
         rd_kafka_toppar_t *rktp = msetw->msetw_rktp;
+        const int16_t max_ApiVersion = rd_kafka_ProduceRequest_max_version;
         int16_t min_ApiVersion = 0;
         int feature;
         /* Map compression types to required feature and ApiVersion */
@@ -115,7 +113,7 @@ rd_kafka_msgset_writer_select_MsgVersion (rd_kafka_msgset_writer_t *msetw) {
                 int feature;
                 int16_t ApiVersion;
         } compr_req[RD_KAFKA_COMPRESSION_NUM] = {
-                [RD_KAFKA_COMPRESSION_LZ4] = { RD_KAFKA_FEATURE_LZ4, 3 },
+                [RD_KAFKA_COMPRESSION_LZ4] = { RD_KAFKA_FEATURE_LZ4, 0 },
 #if WITH_ZSTD
                 [RD_KAFKA_COMPRESSION_ZSTD] = { RD_KAFKA_FEATURE_ZSTD, 7 },
 #endif
@@ -202,11 +200,33 @@ rd_kafka_msgset_writer_select_MsgVersion (rd_kafka_msgset_writer_t *msetw) {
         /* Set the highest ApiVersion supported by us and broker */
         msetw->msetw_ApiVersion = rd_kafka_broker_ApiVersion_supported(
                 rkb,
-                RD_KAFKAP_Produce, min_ApiVersion, 7, NULL);
+                RD_KAFKAP_Produce, min_ApiVersion, max_ApiVersion, NULL);
+
+        if (msetw->msetw_ApiVersion == -1) {
+                rd_kafka_msg_t *rkm;
+                /* This will only happen if the broker reports none, or
+                 * no matching ProduceRequest versions, which should never
+                 * happen. */
+                rd_rkb_log(rkb, LOG_ERR, "PRODUCE",
+                           "%.*s [%"PRId32"]: "
+                           "No viable ProduceRequest ApiVersions (v%d..%d) "
+                           "supported by broker: unable to produce",
+                           RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
+                           rktp->rktp_partition,
+                           min_ApiVersion, max_ApiVersion);
+
+                /* Back off and retry in 5s */
+                rkm = rd_kafka_msgq_first(msetw->msetw_msgq);
+                rd_assert(rkm);
+                rkm->rkm_u.producer.ts_backoff = rd_clock() + (5 * 1000*1000);
+                return -1;
+        }
 
         /* It should not be possible to get a lower version than requested,
          * otherwise the logic in this function is buggy. */
         rd_assert(msetw->msetw_ApiVersion >= min_ApiVersion);
+
+        return 0;
 }
 
 
@@ -325,8 +345,7 @@ rd_kafka_msgset_writer_alloc_buf (rd_kafka_msgset_writer_t *msetw) {
          * space for each message to be copied based on this limit.
          */
         if (rk->rk_conf.msg_copy_max_size > 0) {
-                size_t queued_bytes = rd_kafka_msgq_size(&msetw->msetw_rktp->
-                                                         rktp_xmit_msgq);
+                size_t queued_bytes = rd_kafka_msgq_size(msetw->msetw_msgq);
                 bufsize += RD_MIN(queued_bytes,
                                   (size_t)rk->rk_conf.msg_copy_max_size *
                                   msetw->msetw_msgcntmax);
@@ -423,7 +442,7 @@ rd_kafka_msgset_writer_write_Produce_header (rd_kafka_msgset_writer_t *msetw) {
 
         rd_kafka_buf_t *rkbuf = msetw->msetw_rkbuf;
         rd_kafka_t *rk = msetw->msetw_rkb->rkb_rk;
-        rd_kafka_itopic_t *rkt = msetw->msetw_rktp->rktp_rkt;
+        rd_kafka_topic_t *rkt = msetw->msetw_rktp->rktp_rkt;
 
         /* V3: TransactionalId */
         if (msetw->msetw_ApiVersion >= 3)
@@ -477,8 +496,9 @@ rd_kafka_msgset_writer_write_Produce_header (rd_kafka_msgset_writer_t *msetw) {
 static int rd_kafka_msgset_writer_init (rd_kafka_msgset_writer_t *msetw,
                                         rd_kafka_broker_t *rkb,
                                         rd_kafka_toppar_t *rktp,
+                                        rd_kafka_msgq_t *rkmq,
                                         rd_kafka_pid_t pid) {
-        int msgcnt = rktp->rktp_xmit_msgq.rkmq_msg_cnt;
+        int msgcnt = rd_kafka_msgq_len(rkmq);
 
         if (msgcnt == 0)
                 return 0;
@@ -487,6 +507,7 @@ static int rd_kafka_msgset_writer_init (rd_kafka_msgset_writer_t *msetw,
 
         msetw->msetw_rktp = rktp;
         msetw->msetw_rkb = rkb;
+        msetw->msetw_msgq = rkmq;
         msetw->msetw_pid = pid;
 
         /* Max number of messages to send in a batch,
@@ -498,7 +519,8 @@ static int rd_kafka_msgset_writer_init (rd_kafka_msgset_writer_t *msetw,
         rd_dassert(msetw->msetw_msgcntmax > 0);
 
         /* Select MsgVersion to use */
-        rd_kafka_msgset_writer_select_MsgVersion(msetw);
+        if (rd_kafka_msgset_writer_select_MsgVersion(msetw) == -1)
+                return -1;
 
         /* Allocate backing buffer */
         rd_kafka_msgset_writer_alloc_buf(msetw);
@@ -512,6 +534,10 @@ static int rd_kafka_msgset_writer_init (rd_kafka_msgset_writer_t *msetw,
          * in case of compression. */
         msetw->msetw_firstmsg.of = rd_buf_write_pos(&msetw->msetw_rkbuf->
                                                     rkbuf_buf);
+
+        rd_kafka_msgbatch_init(&msetw->msetw_rkbuf->rkbuf_u.Produce.batch,
+                               rktp, pid);
+        msetw->msetw_batch = &msetw->msetw_rkbuf->rkbuf_u.Produce.batch;
 
         return msetw->msetw_msgcntmax;
 }
@@ -807,12 +833,13 @@ rd_kafka_msgset_writer_write_msg (rd_kafka_msgset_writer_t *msetw,
 static int
 rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
                                    rd_kafka_msgq_t *rkmq) {
-        rd_kafka_buf_t *rkbuf = msetw->msetw_rkbuf;
         rd_kafka_toppar_t *rktp = msetw->msetw_rktp;
         rd_kafka_broker_t *rkb = msetw->msetw_rkb;
         size_t len = rd_buf_len(&msetw->msetw_rkbuf->rkbuf_buf);
-        size_t max_msg_size = (size_t)msetw->msetw_rkb->rkb_rk->
-                rk_conf.max_msg_size;
+        size_t max_msg_size = RD_MIN((size_t)msetw->msetw_rkb->rkb_rk->
+                                     rk_conf.max_msg_size,
+                                     (size_t)msetw->msetw_rkb->rkb_rk->
+                                     rk_conf.batch_size);
         rd_ts_t int_latency_base;
         rd_ts_t MaxTimestamp = 0;
         rd_kafka_msg_t *rkm;
@@ -822,45 +849,22 @@ rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
         /* Internal latency calculation base.
          * Uses rkm_ts_timeout which is enqueue time + timeout */
         int_latency_base = now +
-                (rktp->rktp_rkt->rkt_conf.message_timeout_ms * 1000);
+                ((rd_ts_t) rktp->rktp_rkt->rkt_conf.message_timeout_ms * 1000);
 
         /* Acquire BaseTimestamp from first message. */
         rkm = TAILQ_FIRST(&rkmq->rkmq_msgs);
         rd_kafka_assert(NULL, rkm);
         msetw->msetw_firstmsg.timestamp = rkm->rkm_timestamp;
 
-        /* Idempotent Producer: Acquire BaseSequence from first message */
-        if (rd_kafka_pid_valid(rktp->rktp_eos.pid)) {
-                /* Our msgid counter is 64-bits, but the
-                 * Kafka protocol's is only 31 (signed), so we'll
-                 * need to handle wrapping. */
-                msetw->msetw_firstmsg.msgid = rkm->rkm_u.producer.msgid;
-                msetw->msetw_firstmsg.seq =
-                        rd_kafka_seq_wrap(rkm->rkm_u.producer.msgid -
-                                          rktp->rktp_eos.epoch_base_msgid);
-                rkbuf->rkbuf_u.Produce.base_msgid =
-                        msetw->msetw_firstmsg.msgid;
-                rkbuf->rkbuf_u.Produce.base_seq = msetw->msetw_firstmsg.seq;
-
-                /* Check if there is a stored last message
-                 * on the firstmsg, which means an entire
-                 * batch of messages are being retried and
-                 * we need to maintain the exact messages
-                 * of the original batch.
-                 * Simply tracking the last message, on
-                 * the first message, is sufficient for now.
-                 * Will be 0 if not applicable. */
-                msetw->msetw_lastmsg.msgid = rkm->rkm_u.producer.last_msgid;
-        } else
-                msetw->msetw_firstmsg.seq = -1;
+        rd_kafka_msgbatch_set_first_msg(msetw->msetw_batch, rkm);
 
         /*
          * Write as many messages as possible until buffer is full
          * or limit reached.
          */
         do {
-                if (unlikely(msetw->msetw_lastmsg.msgid &&
-                             msetw->msetw_lastmsg.msgid <
+                if (unlikely(msetw->msetw_batch->last_msgid &&
+                             msetw->msetw_batch->last_msgid <
                              rkm->rkm_u.producer.msgid)) {
                         rd_rkb_dbg(rkb, MSG, "PRODUCE",
                                    "%.*s [%"PRId32"]: "
@@ -870,15 +874,24 @@ rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
                                    RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                                    rktp->rktp_partition,
                                    msgcnt, len,
-                                   msetw->msetw_firstmsg.msgid,
-                                   msetw->msetw_lastmsg.msgid);
+                                   msetw->msetw_batch->first_msgid,
+                                   msetw->msetw_batch->last_msgid);
                         break;
                 }
 
+                /* Check if there is enough space in the current messageset
+                 * to add this message.
+                 * Since calculating the total size of a request at produce()
+                 * time is tricky (we don't know the protocol version or
+                 * MsgVersion that will be used), we allow a messageset to
+                 * overshoot the message.max.bytes limit by one message to
+                 * avoid getting stuck here.
+                 * The actual messageset size is enforced by the broker. */
                 if (unlikely(msgcnt == msetw->msetw_msgcntmax ||
-                             len + rd_kafka_msg_wire_size(rkm, msetw->
-                                                          msetw_MsgVersion) >
-                             max_msg_size)) {
+                             (msgcnt > 0 &&
+                              len + rd_kafka_msg_wire_size(rkm, msetw->
+                                                           msetw_MsgVersion) >
+                              max_msg_size))) {
                         rd_rkb_dbg(rkb, MSG, "PRODUCE",
                                    "%.*s [%"PRId32"]: "
                                    "No more space in current MessageSet "
@@ -897,7 +910,7 @@ rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
 
                 /* Move message to buffer's queue */
                 rd_kafka_msgq_deq(rkmq, rkm, 1);
-                rd_kafka_msgq_enq(&rkbuf->rkbuf_msgq, rkm);
+                rd_kafka_msgq_enq(&msetw->msetw_batch->msgq, rkm);
 
                 msetw->msetw_messages_kvlen += rkm->rkm_len + rkm->rkm_key_len;
 
@@ -913,7 +926,6 @@ rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
                 len += rd_kafka_msgset_writer_write_msg(msetw, rkm, msgcnt, 0,
                                                         NULL);
 
-                rd_dassert(len <= max_msg_size);
                 msgcnt++;
 
         } while ((rkm = TAILQ_FIRST(&rkmq->rkmq_msgs)));
@@ -926,15 +938,17 @@ rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
          * or we can't guarantee exactly-once delivery.
          * If this check fails we raise a fatal error since
          * it is unrecoverable and most likely caused by a bug
-         * in the client implementation. */
-        if (msgcnt > 0 && msetw->msetw_lastmsg.msgid) {
+         * in the client implementation.
+         * This should not be considered an abortable error for
+         * the transactional producer. */
+        if (msgcnt > 0 && msetw->msetw_batch->last_msgid) {
                 rd_kafka_msg_t *lastmsg;
 
-                lastmsg = rd_kafka_msgq_last(&rkbuf->rkbuf_msgq);
+                lastmsg = rd_kafka_msgq_last(&msetw->msetw_batch->msgq);
                 rd_assert(lastmsg);
 
                 if (unlikely(lastmsg->rkm_u.producer.msgid !=
-                             msetw->msetw_lastmsg.msgid)) {
+                             msetw->msetw_batch->last_msgid)) {
                         rd_kafka_set_fatal_error(
                                 rkb->rkb_rk,
                                 RD_KAFKA_RESP_ERR__INCONSISTENT,
@@ -944,8 +958,8 @@ rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
                                 "last message added has msgid %"PRIu64": "
                                 "unable to guarantee consistency",
                                 msgcnt,
-                                msetw->msetw_firstmsg.msgid,
-                                msetw->msetw_lastmsg.msgid,
+                                msetw->msetw_batch->first_msgid,
+                                msetw->msetw_batch->last_msgid,
                                 lastmsg->rkm_u.producer.msgid);
                         return 0;
                 }
@@ -1271,7 +1285,7 @@ static void
 rd_kafka_msgset_writer_finalize_MessageSet_v2_header (
         rd_kafka_msgset_writer_t *msetw) {
         rd_kafka_buf_t *rkbuf = msetw->msetw_rkbuf;
-        int msgcnt = rd_kafka_msgq_len(&rkbuf->rkbuf_msgq);
+        int msgcnt = rd_kafka_msgq_len(&rkbuf->rkbuf_batch.msgq);
 
         rd_kafka_assert(NULL, msgcnt > 0);
         rd_kafka_assert(NULL, msetw->msetw_ApiVersion >= 3);
@@ -1286,6 +1300,10 @@ rd_kafka_msgset_writer_finalize_MessageSet_v2_header (
                                 (int32_t)msetw->msetw_MessageSetSize - (8+4));
 
         msetw->msetw_Attributes |= RD_KAFKA_MSG_ATTR_CREATE_TIME;
+
+        if (rd_kafka_is_transactional(msetw->msetw_rkb->rkb_rk))
+                msetw->msetw_Attributes |=
+                        RD_KAFKA_MSGSET_V2_ATTR_TRANSACTIONAL;
 
         rd_kafka_buf_update_i16(rkbuf, msetw->msetw_of_start +
                                 RD_KAFKAP_MSGSET_V2_OF_Attributes,
@@ -1305,7 +1323,7 @@ rd_kafka_msgset_writer_finalize_MessageSet_v2_header (
 
         rd_kafka_buf_update_i32(rkbuf, msetw->msetw_of_start +
                                 RD_KAFKAP_MSGSET_V2_OF_BaseSequence,
-                                rkbuf->rkbuf_u.Produce.base_seq);
+                                msetw->msetw_batch->first_seq);
 
         rd_kafka_buf_update_i32(rkbuf, msetw->msetw_of_start +
                                 RD_KAFKAP_MSGSET_V2_OF_RecordCount, msgcnt);
@@ -1360,7 +1378,8 @@ rd_kafka_msgset_writer_finalize (rd_kafka_msgset_writer_t *msetw,
         int cnt;
 
         /* No messages added, bail out early. */
-        if (unlikely((cnt = rd_kafka_msgq_len(&rkbuf->rkbuf_msgq)) == 0)) {
+        if (unlikely((cnt =
+                      rd_kafka_msgq_len(&rkbuf->rkbuf_batch.msgq)) == 0)) {
                 rd_kafka_buf_destroy(rkbuf);
                 return NULL;
         }
@@ -1378,11 +1397,13 @@ rd_kafka_msgset_writer_finalize (rd_kafka_msgset_writer_t *msetw,
          * Store request's PID for matching on response
          * if the instance PID has changed and thus made
          * the request obsolete. */
-        msetw->msetw_rkbuf->rkbuf_u.Produce.pid = msetw->msetw_pid;
+        msetw->msetw_rkbuf->rkbuf_u.Produce.batch.pid = msetw->msetw_pid;
 
         /* Compress the message set */
-        if (msetw->msetw_compression)
-                rd_kafka_msgset_writer_compress(msetw, &len);
+        if (msetw->msetw_compression) {
+                if (rd_kafka_msgset_writer_compress(msetw, &len) == -1)
+                        msetw->msetw_compression = 0;
+        }
 
         msetw->msetw_messages_len = len;
 
@@ -1396,16 +1417,21 @@ rd_kafka_msgset_writer_finalize (rd_kafka_msgset_writer_t *msetw,
                    "%s [%"PRId32"]: "
                    "Produce MessageSet with %i message(s) (%"PRIusz" bytes, "
                    "ApiVersion %d, MsgVersion %d, MsgId %"PRIu64", "
-                   "BaseSeq %"PRId32", %s)",
+                   "BaseSeq %"PRId32", %s, %s)",
                    rktp->rktp_rkt->rkt_topic->str, rktp->rktp_partition,
                    cnt, msetw->msetw_MessageSetSize,
                    msetw->msetw_ApiVersion, msetw->msetw_MsgVersion,
-                   msetw->msetw_firstmsg.msgid,
-                   msetw->msetw_firstmsg.seq,
-                   rd_kafka_pid2str(msetw->msetw_pid));
+                   msetw->msetw_batch->first_msgid,
+                   msetw->msetw_batch->first_seq,
+                   rd_kafka_pid2str(msetw->msetw_pid),
+                   msetw->msetw_compression ?
+                   rd_kafka_compression2str(msetw->msetw_compression) :
+                   "uncompressed");
 
-        rd_kafka_msgq_verify_order(rktp, &rkbuf->rkbuf_msgq,
-                                   msetw->msetw_firstmsg.msgid, rd_true);
+        rd_kafka_msgq_verify_order(rktp, &msetw->msetw_batch->msgq,
+                                   msetw->msetw_batch->first_msgid, rd_false);
+
+        rd_kafka_msgbatch_ready_produce(msetw->msetw_batch);
 
         return rkbuf;
 }
@@ -1428,20 +1454,21 @@ rd_kafka_msgset_writer_finalize (rd_kafka_msgset_writer_t *msetw,
 rd_kafka_buf_t *
 rd_kafka_msgset_create_ProduceRequest (rd_kafka_broker_t *rkb,
                                        rd_kafka_toppar_t *rktp,
+                                       rd_kafka_msgq_t *rkmq,
                                        const rd_kafka_pid_t pid,
                                        size_t *MessageSetSizep) {
 
         rd_kafka_msgset_writer_t msetw;
 
-        if (rd_kafka_msgset_writer_init(&msetw, rkb, rktp, pid) == 0)
+        if (rd_kafka_msgset_writer_init(&msetw, rkb, rktp, rkmq, pid) <= 0)
                 return NULL;
 
-        if (!rd_kafka_msgset_writer_write_msgq(&msetw, &rktp->rktp_xmit_msgq)) {
+        if (!rd_kafka_msgset_writer_write_msgq(&msetw, msetw.msetw_msgq)) {
                 /* Error while writing messages to MessageSet,
                  * move all messages back on the xmit queue. */
-                rd_kafka_msgq_insert_msgq(&rktp->rktp_xmit_msgq,
-                                          &msetw.msetw_rkbuf->rkbuf_msgq,
-                                          rktp->rktp_rkt->rkt_conf.msg_order_cmp);
+                rd_kafka_msgq_insert_msgq(
+                        rkmq, &msetw.msetw_batch->msgq,
+                        rktp->rktp_rkt->rkt_conf.msg_order_cmp);
         }
 
         return rd_kafka_msgset_writer_finalize(&msetw, MessageSetSizep);

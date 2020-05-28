@@ -35,6 +35,7 @@
 #include "rd.h"
 #include "rdkafka_int.h"
 #include "rdkafka_event.h"
+#include "rdkafka_interceptor.h"
 
 /**
  * @brief Call the registered background_event_cb.
@@ -111,12 +112,19 @@ int rd_kafka_background_thread_main (void *arg) {
         rd_kafka_set_thread_name("background");
         rd_kafka_set_thread_sysname("rdk:bg");
 
+        rd_kafka_interceptors_on_thread_start(rk, RD_KAFKA_THREAD_BACKGROUND);
+
         (void)rd_atomic32_add(&rd_kafka_thread_cnt_curr, 1);
 
         /* Acquire lock (which was held by thread creator during creation)
          * to synchronise state. */
         rd_kafka_wrlock(rk);
         rd_kafka_wrunlock(rk);
+
+        mtx_lock(&rk->rk_init_lock);
+        rk->rk_init_wait_cnt--;
+        cnd_broadcast(&rk->rk_init_cnd);
+        mtx_unlock(&rk->rk_init_lock);
 
         while (likely(!rd_kafka_terminating(rk))) {
                 rd_kafka_q_serve(rk->rk_background.q, 10*1000, 0,
@@ -135,6 +143,8 @@ int rd_kafka_background_thread_main (void *arg) {
 
         rd_kafka_dbg(rk, GENERIC, "BGQUEUE",
                      "Background queue thread exiting");
+
+        rd_kafka_interceptors_on_thread_exit(rk, RD_KAFKA_THREAD_BACKGROUND);
 
         rd_atomic32_sub(&rd_kafka_thread_cnt_curr, 1);
 

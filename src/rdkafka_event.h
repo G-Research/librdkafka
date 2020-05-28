@@ -41,7 +41,8 @@ rd_kafka_event_type_t rd_kafka_op2event (rd_kafka_op_type_t optype) {
 		[RD_KAFKA_OP_REBALANCE] = RD_KAFKA_EVENT_REBALANCE,
 		[RD_KAFKA_OP_OFFSET_COMMIT] = RD_KAFKA_EVENT_OFFSET_COMMIT,
                 [RD_KAFKA_OP_LOG] = RD_KAFKA_EVENT_LOG,
-		[RD_KAFKA_OP_STATS] = RD_KAFKA_EVENT_STATS
+		[RD_KAFKA_OP_STATS] = RD_KAFKA_EVENT_STATS,
+                [RD_KAFKA_OP_OAUTHBEARER_REFRESH] = RD_KAFKA_EVENT_OAUTHBEARER_TOKEN_REFRESH
 	};
 
 	return map[(int)optype & ~RD_KAFKA_OP_FLAGMASK];
@@ -80,6 +81,7 @@ int rd_kafka_event_setup (rd_kafka_t *rk, rd_kafka_op_t *rko) {
                                 if (rko->rko_u.err.errstr)
                                         rd_free(rko->rko_u.err.errstr);
                                 rko->rko_u.err.errstr = rd_strdup(errstr);
+                                rko->rko_u.err.fatal = 1;
                         }
                 }
                 return 1;
@@ -93,10 +95,10 @@ int rd_kafka_event_setup (rd_kafka_t *rk, rd_kafka_op_t *rko) {
         case RD_KAFKA_EVENT_CREATEPARTITIONS_RESULT:
         case RD_KAFKA_EVENT_ALTERCONFIGS_RESULT:
         case RD_KAFKA_EVENT_DESCRIBECONFIGS_RESULT:
+        case RD_KAFKA_EVENT_OAUTHBEARER_TOKEN_REFRESH:
 		return 1;
 
 	default:
 		return 0;
-		
 	}
 }

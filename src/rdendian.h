@@ -66,7 +66,7 @@
  #include <endian.h>
 #elif defined __BSD__
   #include <sys/endian.h>
-#elif defined sun
+#elif defined __sun
   #include <sys/byteorder.h>
   #include <sys/isa_defs.h>
 #define __LITTLE_ENDIAN 1234
@@ -89,7 +89,7 @@
 #define le64toh(x) (x)
 #define htole16(x) (x)
 #define htole64(x) (x)
-#endif /* sun */
+#endif /* __sun */
 
 #elif defined __APPLE__
   #include <machine/endian.h>
@@ -110,7 +110,7 @@
 #define le64toh(x) (x)
 #endif
 
-#elif defined(_MSC_VER)
+#elif defined(_WIN32)
 #include <intrin.h>
 
 #define be64toh(x) _byteswap_uint64(x)

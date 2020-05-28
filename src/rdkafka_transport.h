@@ -29,7 +29,7 @@
 #ifndef _RDKAFKA_TRANSPORT_H_
 #define _RDKAFKA_TRANSPORT_H_
 
-#ifndef _MSC_VER
+#ifndef _WIN32
 #include <poll.h>
 #endif
 
@@ -38,8 +38,8 @@
 
 typedef struct rd_kafka_transport_s rd_kafka_transport_t;
 
-void rd_kafka_transport_io_serve (rd_kafka_transport_t *rktrans,
-                                  int timeout_ms);
+int rd_kafka_transport_io_serve (rd_kafka_transport_t *rktrans,
+                                 int timeout_ms);
 
 ssize_t rd_kafka_transport_send (rd_kafka_transport_t *rktrans,
                                  rd_slice_t *slice,
@@ -54,26 +54,24 @@ void rd_kafka_transport_request_sent (rd_kafka_broker_t *rkb,
 int rd_kafka_transport_framed_recv (rd_kafka_transport_t *rktrans,
                                     rd_kafka_buf_t **rkbufp,
                                     char *errstr, size_t errstr_size);
+
+rd_kafka_transport_t *rd_kafka_transport_new (rd_kafka_broker_t *rkb,
+                                              rd_socket_t s,
+                                              char *errstr,
+                                              size_t errstr_size);
 struct rd_kafka_broker_s;
 rd_kafka_transport_t *rd_kafka_transport_connect(struct rd_kafka_broker_s *rkb, const rd_sockaddr_inx_t *sinx,
                                                  char *errstr, size_t errstr_size);
 void rd_kafka_transport_connect_done (rd_kafka_transport_t *rktrans,
 				      char *errstr);
 
+void rd_kafka_transport_post_connect_setup (rd_kafka_transport_t *rktrans);
+
 void rd_kafka_transport_close(rd_kafka_transport_t *rktrans);
 void rd_kafka_transport_poll_set(rd_kafka_transport_t *rktrans, int event);
 void rd_kafka_transport_poll_clear(rd_kafka_transport_t *rktrans, int event);
 int rd_kafka_transport_poll(rd_kafka_transport_t *rktrans, int tmout);
 
-#if WITH_SSL
-void rd_kafka_transport_ssl_ctx_term (rd_kafka_t *rk);
-int rd_kafka_transport_ssl_ctx_init (rd_kafka_t *rk,
-				     char *errstr, size_t errstr_size);
-
-void rd_kafka_transport_ssl_term (void);
-void rd_kafka_transport_ssl_init (void);
-#endif
-void rd_kafka_transport_term (void);
-void rd_kafka_transport_init(void);
+void rd_kafka_transport_init (void);
 
 #endif /* _RDKAFKA_TRANSPORT_H_ */

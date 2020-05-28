@@ -100,10 +100,7 @@ int main_0088_produce_metadata_timeout (int argc, char **argv) {
 
         testid = test_id_generate();
 
-        /* Create topic with single partition, for simplicity. */
-        test_create_topic(topic, 1, 1);
-
-        test_conf_init(&conf, NULL, 15*60*2); // msgcnt * 2);
+        test_conf_init(&conf, NULL, 15*60*2);
         rd_kafka_conf_set_dr_msg_cb(conf, dr_msg_cb);
         test_conf_set(conf, "metadata.max.age.ms", "10000");
         test_conf_set(conf, "topic.metadata.refresh.interval.ms", "-1");
@@ -115,11 +112,15 @@ int main_0088_produce_metadata_timeout (int argc, char **argv) {
         test_curr->is_fatal_cb = is_fatal_cb;
 
         rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
+
+        /* Create topic with single partition, for simplicity. */
+        test_create_topic(rk, topic, 1, 1);
+
         rkt = rd_kafka_topic_new(rk, topic, NULL);
 
         /* Produce first set of messages and wait for delivery */
         test_produce_msgs_nowait(rk, rkt, testid, RD_KAFKA_PARTITION_UA,
-                                 msgcnt, 20, NULL, 0, &msgcnt);
+                                 msgcnt, 20, NULL, 0, 0, &msgcnt);
         while (msg_dr_cnt < 5)
                 rd_kafka_poll(rk, 1000);
 
@@ -135,7 +136,7 @@ int main_0088_produce_metadata_timeout (int argc, char **argv) {
 
         /* These messages will be put on the UA queue */
         test_produce_msgs_nowait(rk, rkt, testid, RD_KAFKA_PARTITION_UA,
-                                 msgcnt, 20, NULL, 0, &msgcnt);
+                                 msgcnt, 20, NULL, 0, 0, &msgcnt);
 
         /* Restore the connection(s) when metadata has timed out. */
         TEST_SAY(_C_YEL "Allowing connections\n");
@@ -143,7 +144,7 @@ int main_0088_produce_metadata_timeout (int argc, char **argv) {
 
         rd_sleep(3);
         test_produce_msgs_nowait(rk, rkt, testid, RD_KAFKA_PARTITION_UA,
-                                 msgcnt, 20, NULL, 0, &msgcnt);
+                                 msgcnt, 20, NULL, 0, 0, &msgcnt);
 
         test_flush(rk, 2*5*1000); /* linger.ms * 2 */
 
