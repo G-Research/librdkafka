@@ -622,8 +622,12 @@ static void rd_kafka_txn_handle_AddPartitionsToTxn (rd_kafka_t *rk,
                                 break;
 
                         case RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED:
-                                p_actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
-                                err = ErrorCode;
+                                if (rk->rk_conf.retry_topic_authorization_failed) {
+                                    p_actions |= RD_KAFKA_ERR_ACTION_RETRY;
+                                } else {
+                                    p_actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
+                                    err = ErrorCode;
+                                }
                                 break;
 
                         case RD_KAFKA_RESP_ERR_OPERATION_NOT_ATTEMPTED:
@@ -1470,6 +1474,12 @@ static void rd_kafka_txn_handle_TxnOffsetCommit (rd_kafka_t *rk,
                 break;
 
         case RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED:
+            if (rk->rk_conf.retry_topic_authorization_failed)
+                actions |= RD_KAFKA_ERR_ACTION_RETRY;
+            else
+                actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
+            break;
+
         case RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED:
                 actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
                 break;
@@ -1681,6 +1691,12 @@ static void rd_kafka_txn_handle_AddOffsetsToTxn (rd_kafka_t *rk,
                 break;
 
         case RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED:
+            if (rk->rk_conf.retry_topic_authorization_failed)
+                actions |= RD_KAFKA_ERR_ACTION_RETRY;
+            else
+                actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
+                break;
+
         case RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED:
                 actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
                 break;

@@ -943,6 +943,7 @@ static int rd_kafka_handle_OffsetCommit_error (
                 RD_KAFKA_ERR_ACTION_PERMANENT,
                 RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
 
+                /** should be RD_KAFKA_ERR_ACTION_RETRY when configured to be retryable */
                 RD_KAFKA_ERR_ACTION_PERMANENT,
                 RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
 
@@ -3086,7 +3087,8 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                  * to message-level timeout error code. */
                 perr->err = RD_KAFKA_RESP_ERR__MSG_TIMED_OUT;
 
-        } else if (perr->err == RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED) {
+        } else if (perr->err == RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED &&
+                   !rk->rk_conf.retry_topic_authorization_failed) {
                 /* If we're no longer authorized to access the topic mark
                  * it as errored to deny further produce requests. */
                 rd_kafka_topic_wrlock(rktp->rktp_rkt);

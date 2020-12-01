@@ -1315,6 +1315,11 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
 	  _RK(retry_backoff_ms),
 	  "The backoff time in milliseconds before retrying a protocol request.",
 	  1, 300*1000, 100 },
+    { _RK_GLOBAL, "retry.topic.authorization.failed",
+            _RK_C_BOOL, _RK(retry_topic_authorization_failed),
+            "Treat RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED errors "
+            "as retryable when set to `true`, otherwise they are fatal.",
+            0, 1, 0 },
 
 	{ _RK_GLOBAL|_RK_PRODUCER, "queue.buffering.backpressure.threshold",
           _RK_C_INT, _RK(queue_backpressure_thres),
