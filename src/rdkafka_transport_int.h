@@ -39,10 +39,14 @@
 #include <openssl/pkcs12.h>
 #endif
 
-struct rd_kafka_transport_s {	
-	int rktrans_s;
-	
-	rd_kafka_broker_t *rktrans_rkb;
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#endif
+
+struct rd_kafka_transport_s {
+        rd_socket_t rktrans_s;
+        rd_kafka_broker_t *rktrans_rkb;    /* Not reference counted */
 
 #if WITH_SSL
 	SSL *rktrans_ssl;
@@ -73,15 +77,14 @@ struct rd_kafka_transport_s {
          * - TCP socket
          * - wake-up fd
          */
-#ifndef _MSC_VER
-        struct pollfd rktrans_pfd[2];
-#else
-        WSAPOLLFD rktrans_pfd[2];
-#endif
+        rd_pollfd_t rktrans_pfd[2];
         int rktrans_pfd_cnt;
 
         size_t rktrans_rcvbuf_size;    /**< Socket receive buffer size */
         size_t rktrans_sndbuf_size;    /**< Socket send buffer size */
 };
+
+
+extern RD_TLS rd_kafka_transport_t *rd_kafka_curr_transport;
 
 #endif /* _RDKAFKA_TRANSPORT_INT_H_ */

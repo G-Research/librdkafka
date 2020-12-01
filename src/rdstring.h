@@ -30,6 +30,20 @@
 #ifndef _RDSTRING_H_
 #define _RDSTRING_H_
 
+static RD_INLINE RD_UNUSED
+void rd_strlcpy (char *dst, const char *src, size_t dstsize) {
+#if HAVE_STRLCPY
+        (void)strlcpy(dst, src, dstsize);
+#else
+        if (likely(dstsize > 0)) {
+                size_t srclen = strlen(src);
+                size_t copylen = RD_MIN(srclen, dstsize-1);
+                memcpy(dst, src, copylen);
+                dst[copylen] = '\0';
+        }
+#endif
+}
+
 
 
 char *rd_string_render (const char *templ,
@@ -60,5 +74,12 @@ void *rd_strtup_list_copy (const void *elem, void *opaque);
 
 char *rd_flags2str (char *dst, size_t size,
                     const char **desc, int flags);
+
+unsigned int rd_string_hash (const char *str, ssize_t len);
+
+int rd_strcmp (const char *a, const char *b);
+
+/** @returns "true" if EXPR is true, else "false" */
+#define RD_STR_ToF(EXPR) ((EXPR) ? "true" : "false")
 
 #endif /* _RDSTRING_H_ */

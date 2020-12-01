@@ -34,9 +34,6 @@ target_link_libraries(rdkafka++ PUBLIC rdkafka)
 target_include_directories(rdkafka++ PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}>")
 if(NOT RDKAFKA_BUILD_STATIC)
     target_compile_definitions(rdkafka++ PRIVATE LIBRDKAFKACPP_EXPORTS)
-    if(WIN32)
-        target_compile_definitions(rdkafka++ INTERFACE LIBRDKAFKACPP_EXPORTS=0)
-    endif()
 endif()
 
 # Generate pkg-config file
@@ -57,7 +54,7 @@ set(PKG_CONFIG_LIBS
     "-L\${libdir} -lrdkafka++"
 )
 set(PKG_CONFIG_LIBS_PRIVATE
-    "-lrdkafka -lstdc++"
+    "-lrdkafka"
 )
 configure_file(
     "../packaging/cmake/rdkafka.pc.in"

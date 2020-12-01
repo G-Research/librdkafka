@@ -529,7 +529,7 @@ static void NTAPI _tinycthread_tss_callback(PVOID h, DWORD dwReason, PVOID pv)
   }
 }
 
-#if defined(_MSC_VER)
+#ifdef _WIN32
   #ifdef _M_X64
     #pragma const_seg(".CRT$XLB")
   #else
@@ -537,9 +537,9 @@ static void NTAPI _tinycthread_tss_callback(PVOID h, DWORD dwReason, PVOID pv)
   #endif
   PIMAGE_TLS_CALLBACK p_thread_callback = _tinycthread_tss_callback;
   #ifdef _M_X64
-    #pragma data_seg()
-  #else
     #pragma const_seg()
+  #else
+    #pragma data_seg()
   #endif
 #else
   PIMAGE_TLS_CALLBACK p_thread_callback __attribute__((section(".CRT$XLB"))) = _tinycthread_tss_callback;

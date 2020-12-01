@@ -67,7 +67,8 @@ typedef struct rd_kafka_replyq_s {
 #define RD_KAFKA_OP_F_BLOCKING    0x8  /* rkbuf: blocking protocol request */
 #define RD_KAFKA_OP_F_REPROCESS   0x10 /* cgrp: Reprocess at a later time. */
 #define RD_KAFKA_OP_F_SENT        0x20 /* rkbuf: request sent on wire */
-
+#define RD_KAFKA_OP_F_FLEXVER     0x40 /* rkbuf: flexible protocol version
+                                        *        (KIP-482) */
 
 typedef enum {
         RD_KAFKA_OP_NONE,     /* No specific type, use OP_CB */
@@ -107,6 +108,7 @@ typedef enum {
 				      * Reuses u.assign */
 	RD_KAFKA_OP_THROTTLE,        /* Throttle info */
 	RD_KAFKA_OP_NAME,            /* Request name */
+        RD_KAFKA_OP_CG_METADATA,     /**< Request consumer metadata */
 	RD_KAFKA_OP_OFFSET_RESET,    /* Offset reset */
         RD_KAFKA_OP_METADATA,        /* Metadata response */
         RD_KAFKA_OP_LOG,             /* Log */
@@ -119,6 +121,11 @@ typedef enum {
         RD_KAFKA_OP_ADMIN_RESULT,    /**< Admin API .._result_t */
         RD_KAFKA_OP_PURGE,           /**< Purge queues */
         RD_KAFKA_OP_CONNECT,         /**< Connect (to broker) */
+        RD_KAFKA_OP_OAUTHBEARER_REFRESH, /**< Refresh OAUTHBEARER token */
+        RD_KAFKA_OP_MOCK,            /**< Mock cluster command */
+        RD_KAFKA_OP_BROKER_MONITOR,    /**< Broker state change */
+        RD_KAFKA_OP_TXN,             /**< Transaction command */
+        RD_KAFKA_OP_GET_REBALANCE_PROTOCOL, /**< Get rebalance protocol */
         RD_KAFKA_OP__END
 } rd_kafka_op_type_t;
 
@@ -187,6 +194,15 @@ typedef rd_kafka_op_res_t
         RD_WARN_UNUSED_RESULT;
 
 /**
+ * @brief Enumerates the assign op sub-types.
+ */
+typedef enum {
+        RD_KAFKA_ASSIGN_METHOD_ASSIGN,        /**< Absolute assign/unassign */
+        RD_KAFKA_ASSIGN_METHOD_INCR_ASSIGN,   /**< Incremental assign */
+        RD_KAFKA_ASSIGN_METHOD_INCR_UNASSIGN  /**< Incremental unassign */
+} rd_kafka_assign_method_t;
+
+/**
  * @brief Op callback type
  */
 typedef rd_kafka_op_res_t (rd_kafka_op_cb_t) (rd_kafka_t *rk,
@@ -209,12 +225,13 @@ struct rd_kafka_op_s {
 	int                   rko_flags;  /* See RD_KAFKA_OP_F_... above */
 	int32_t               rko_version;
 	rd_kafka_resp_err_t   rko_err;
+        rd_kafka_error_t     *rko_error;
 	int32_t               rko_len;    /* Depends on type, typically the
 					   * message length. */
         rd_kafka_prio_t       rko_prio;   /**< In-queue priority.
                                            *   Higher value means higher prio*/
 
-	shptr_rd_kafka_toppar_t *rko_rktp;
+	rd_kafka_toppar_t    *rko_rktp;
 
         /*
 	 * Generic fields
@@ -270,20 +287,28 @@ struct rd_kafka_op_s {
 
 		struct {
 			rd_kafka_topic_partition_list_t *partitions;
+                        rd_kafka_assign_method_t method;
 		} assign; /* also used for GET_ASSIGNMENT */
 
-		struct {
-			rd_kafka_topic_partition_list_t *partitions;
-		} rebalance;
+                struct {
+                        rd_kafka_topic_partition_list_t *partitions;
+                } rebalance;
+
+                struct {
+                        const char *str;
+                } rebalance_protocol;
 
 		struct {
 			char *str;
 		} name;
 
+                rd_kafka_consumer_group_metadata_t *cg_metadata;
+
 		struct {
 			int64_t offset;
 			char *errstr;
 			rd_kafka_msg_t rkm;
+                        rd_kafka_topic_t *rkt;
                         int fatal;  /**< This was a ERR__FATAL error that has
                                      *   been translated to the fatal error
                                      *   code. */
@@ -312,7 +337,7 @@ struct rd_kafka_op_s {
                 } metadata;
 
 		struct {
-			shptr_rd_kafka_itopic_t *s_rkt;
+			rd_kafka_topic_t *rkt;
 			rd_kafka_msgq_t msgq;
 			rd_kafka_msgq_t msgq2;
 			int do_purge2;
@@ -342,6 +367,7 @@ struct rd_kafka_op_s {
                         char fac[64];
                         int  level;
                         char *str;
+                        int  ctx;
                 } log;
 
                 struct {
@@ -420,7 +446,75 @@ struct rd_kafka_op_s {
                 struct {
                         int flags; /**< purge_flags from rd_kafka_purge() */
                 } purge;
-	} rko_u;
+
+                /**< Mock cluster command */
+                struct {
+                        enum {
+                                RD_KAFKA_MOCK_CMD_TOPIC_SET_ERROR,
+                                RD_KAFKA_MOCK_CMD_TOPIC_CREATE,
+                                RD_KAFKA_MOCK_CMD_PART_SET_LEADER,
+                                RD_KAFKA_MOCK_CMD_PART_SET_FOLLOWER,
+                                RD_KAFKA_MOCK_CMD_PART_SET_FOLLOWER_WMARKS,
+                                RD_KAFKA_MOCK_CMD_BROKER_SET_UPDOWN,
+                                RD_KAFKA_MOCK_CMD_BROKER_SET_RTT,
+                                RD_KAFKA_MOCK_CMD_BROKER_SET_RACK,
+                                RD_KAFKA_MOCK_CMD_COORD_SET,
+                                RD_KAFKA_MOCK_CMD_APIVERSION_SET,
+                        } cmd;
+
+                        rd_kafka_resp_err_t err; /**< Error for:
+                                                  *    TOPIC_SET_ERROR */
+                        char *name;              /**< For:
+                                                  *    TOPIC_SET_ERROR
+                                                  *    TOPIC_CREATE
+                                                  *    PART_SET_FOLLOWER
+                                                  *    PART_SET_FOLLOWER_WMARKS
+                                                  *    BROKER_SET_RACK
+                                                  *    COORD_SET (key_type) */
+                        char *str;               /**< For:
+                                                  *    COORD_SET (key) */
+                        int32_t partition;       /**< For:
+                                                  *    PART_SET_FOLLOWER
+                                                  *    PART_SET_FOLLOWER_WMARKS
+                                                  *    PART_SET_LEADER
+                                                  *    APIVERSION_SET (ApiKey)
+                                                  */
+                        int32_t broker_id;       /**< For:
+                                                  *    PART_SET_FOLLOWER
+                                                  *    PART_SET_LEADER
+                                                  *    BROKER_SET_UPDOWN
+                                                  *    BROKER_SET_RACK
+                                                  *    COORD_SET */
+                        int64_t lo;              /**< Low offset, for:
+                                                  *    TOPIC_CREATE (part cnt)
+                                                  *    PART_SET_FOLLOWER_WMARKS
+                                                  *    BROKER_SET_UPDOWN
+                                                  *    APIVERSION_SET (minver)
+                                                  *    BROKER_SET_RTT
+                                                  */
+                        int64_t hi;              /**< High offset, for:
+                                                  *    TOPIC_CREATE (repl fact)
+                                                  *    PART_SET_FOLLOWER_WMARKS
+                                                  *    APIVERSION_SET (maxver)
+                                                  */
+                } mock;
+
+                struct {
+                        struct rd_kafka_broker_s *rkb; /**< Broker who's state
+                                                        *   changed. */
+                        /**< Callback to trigger on the op handler's thread. */
+                        void (*cb) (struct rd_kafka_broker_s *rkb);
+                } broker_monitor;
+
+                struct {
+                        char *group_id; /**< Consumer group id for commits */
+                        int   timeout_ms; /**< Operation timeout */
+                        rd_ts_t abs_timeout; /**< Absolute time */
+                        /**< Offsets to commit */
+                        rd_kafka_topic_partition_list_t *offsets;
+                } txn;
+
+        } rko_u;
 };
 
 TAILQ_HEAD(rd_kafka_op_head_s, rd_kafka_op_s);
@@ -444,29 +538,39 @@ rd_kafka_op_t *rd_kafka_op_new_reply (rd_kafka_op_t *rko_orig,
 rd_kafka_op_t *rd_kafka_op_new_cb (rd_kafka_t *rk,
                                    rd_kafka_op_type_t type,
                                    rd_kafka_op_cb_t *cb);
-int rd_kafka_op_reply (rd_kafka_op_t *rko, rd_kafka_resp_err_t err);
+int rd_kafka_op_reply (rd_kafka_op_t *rko,
+                       rd_kafka_resp_err_t err);
+int rd_kafka_op_error_reply (rd_kafka_op_t *rko,
+                             rd_kafka_error_t *error);
 
 #define rd_kafka_op_set_prio(rko,prio) ((rko)->rko_prio = prio)
-
 
 #define rd_kafka_op_err(rk,err,...) do {				\
 		if (!((rk)->rk_conf.enabled_events & RD_KAFKA_EVENT_ERROR)) { \
 			rd_kafka_log(rk, LOG_ERR, "ERROR", __VA_ARGS__); \
 			break;						\
 		}							\
-		rd_kafka_q_op_err((rk)->rk_rep, RD_KAFKA_OP_ERR, err, 0, \
-				  NULL, 0, __VA_ARGS__);		\
+		rd_kafka_q_op_err((rk)->rk_rep, err, __VA_ARGS__);      \
 	} while (0)
 
-void rd_kafka_q_op_err (rd_kafka_q_t *rkq, rd_kafka_op_type_t optype,
-                        rd_kafka_resp_err_t err, int32_t version,
-                        rd_kafka_toppar_t *rktp, int64_t offset,
-			const char *fmt, ...);
+void rd_kafka_q_op_err (rd_kafka_q_t *rkq, rd_kafka_resp_err_t err,
+                        const char *fmt, ...)
+        RD_FORMAT(printf, 3, 4);
+void rd_kafka_consumer_err (rd_kafka_q_t *rkq, int32_t broker_id,
+                            rd_kafka_resp_err_t err, int32_t version,
+                            const char *topic, rd_kafka_toppar_t *rktp,
+                            int64_t offset, const char *fmt, ...)
+        RD_FORMAT(printf, 8, 9);
+rd_kafka_op_t *rd_kafka_op_req0 (rd_kafka_q_t *destq,
+                                 rd_kafka_q_t *recvq,
+                                 rd_kafka_op_t *rko,
+                                 int timeout_ms);
 rd_kafka_op_t *rd_kafka_op_req (rd_kafka_q_t *destq,
                                 rd_kafka_op_t *rko,
                                 int timeout_ms);
 rd_kafka_op_t *rd_kafka_op_req2 (rd_kafka_q_t *destq, rd_kafka_op_type_t type);
 rd_kafka_resp_err_t rd_kafka_op_err_destroy (rd_kafka_op_t *rko);
+rd_kafka_error_t *rd_kafka_op_error_destroy (rd_kafka_op_t *rko);
 
 rd_kafka_op_res_t rd_kafka_op_call (rd_kafka_t *rk,
                                     rd_kafka_q_t *rkq, rd_kafka_op_t *rko)
@@ -480,6 +584,12 @@ rd_kafka_op_new_fetch_msg (rd_kafka_msg_t **rkmp,
                            int64_t offset,
                            size_t key_len, const void *key,
                            size_t val_len, const void *val);
+
+rd_kafka_op_t *
+rd_kafka_op_new_ctrl_msg (rd_kafka_toppar_t *rktp,
+                           int32_t version,
+                           rd_kafka_buf_t *rkbuf,
+                           int64_t offset);
 
 void rd_kafka_op_throttle_time (struct rd_kafka_broker_s *rkb,
 				rd_kafka_q_t *rkq,
@@ -496,7 +606,12 @@ extern rd_atomic32_t rd_kafka_op_cnt;
 
 void rd_kafka_op_print (FILE *fp, const char *prefix, rd_kafka_op_t *rko);
 
-void rd_kafka_op_offset_store (rd_kafka_t *rk, rd_kafka_op_t *rko,
-			       const rd_kafka_message_t *rkmessage);
+void rd_kafka_op_offset_store (rd_kafka_t *rk, rd_kafka_op_t *rko);
+
+
+#define rd_kafka_op_is_ctrl_msg(rko)                                    \
+        ((rko)->rko_type == RD_KAFKA_OP_FETCH &&                        \
+         !(rko)->rko_err &&                                             \
+         ((rko)->rko_u.fetch.rkm.rkm_flags & RD_KAFKA_MSG_F_CONTROL))
 
 #endif /* _RDKAFKA_OP_H_ */

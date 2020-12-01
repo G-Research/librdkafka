@@ -54,25 +54,29 @@ int32_t my_invalid_partitioner (const rd_kafka_topic_t *rkt,
  *        Still a useful test though. */
 static void do_test_failed_partitioning (void) {
 	rd_kafka_t *rk;
+        rd_kafka_conf_t *conf;
 	rd_kafka_topic_t *rkt;
 	rd_kafka_topic_conf_t *tconf;
 	const char *topic = test_mk_topic_name(__FUNCTION__, 1);
 	int i;
+        int msgcnt = test_quick ? 100 : 10000;
 
-	test_conf_init(NULL, &tconf, 0);
+        test_conf_init(&conf, &tconf, 0);
+        rd_kafka_conf_set_dr_msg_cb(conf, test_dr_msg_cb);
+        test_conf_set(conf, "sticky.partitioning.linger.ms", "0");
+        rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
 
-	rk = test_create_producer();
-	rd_kafka_topic_conf_set_partitioner_cb(tconf, my_invalid_partitioner);
+      rd_kafka_topic_conf_set_partitioner_cb(tconf, my_invalid_partitioner);
 	test_topic_conf_set(tconf, "message.timeout.ms",
                             tsprintf("%d", tmout_multip(10000)));
 	rkt = rd_kafka_topic_new(rk, topic, tconf);
 	TEST_ASSERT(rkt != NULL, "%s", rd_kafka_err2str(rd_kafka_last_error()));
 
 	/* Produce some messages (to p 0) to create topic */
-	test_produce_msgs(rk, rkt, 0, 0, 0, 100, NULL, 0);
+	  test_produce_msgs(rk, rkt, 0, 0, 0, 2, NULL, 0);
 
 	/* Now use partitioner */
-	for (i = 0 ; i < 10000 ; i++) {
+	for (i = 0 ; i < msgcnt ; i++) {
 		rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
 		if (rd_kafka_produce(rkt, RD_KAFKA_PARTITION_UA,
 				     0, NULL, 0, NULL, 0, NULL) == -1)
@@ -126,6 +130,7 @@ static void do_test_partitioner (const char *topic, const char *partitioner,
         rd_kafka_conf_set_opaque(conf, &remains);
         rd_kafka_conf_set_dr_msg_cb(conf, part_dr_msg_cb);
         test_conf_set(conf, "partitioner", partitioner);
+        test_conf_set(conf, "sticky.partitioning.linger.ms", "0");
 
         rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
 
@@ -219,7 +224,7 @@ extern uint32_t rd_crc32 (const char *, size_t);
  * @brief Test all builtin partitioners
  */
 static void do_test_partitioners (void) {
-#define _PART_CNT 17
+        int part_cnt = test_quick ? 7 : 17;
 #define _MSG_CNT 5
         const char *unaligned = "123456";
         /* Message keys */
@@ -239,40 +244,55 @@ static void do_test_partitioners (void) {
                 { "consistent", {
                                 /* These constants were acquired using
                                  * the 'crc32' command on OSX */
-                                0x0 % _PART_CNT,
-                                0x0 % _PART_CNT,
-                                0xb1b451d7 % _PART_CNT,
-                                0xb0150df7 % _PART_CNT,
-                                0xd077037e % _PART_CNT
+                                0x0 % part_cnt,
+                                0x0 % part_cnt,
+                                0xb1b451d7 % part_cnt,
+                                0xb0150df7 % part_cnt,
+                                0xd077037e % part_cnt
                         } },
                 { "consistent_random", {
                                 -1,
                                 -1,
-                                0xb1b451d7 % _PART_CNT,
-                                0xb0150df7 % _PART_CNT,
-                                0xd077037e % _PART_CNT
+                                0xb1b451d7 % part_cnt,
+                                0xb0150df7 % part_cnt,
+                                0xd077037e % part_cnt
                         } },
                 { "murmur2", {
                                 /* .. using tests/java/Murmur2Cli */
-                                0x106e08d9 % _PART_CNT,
-                                0x106e08d9 % _PART_CNT,
-                                0x058d780f % _PART_CNT,
-                                0x4f7703da % _PART_CNT,
-                                0x5ec19395 % _PART_CNT
+                                0x106e08d9 % part_cnt,
+                                0x106e08d9 % part_cnt,
+                                0x058d780f % part_cnt,
+                                0x4f7703da % part_cnt,
+                                0x5ec19395 % part_cnt
                         } },
                 { "murmur2_random", {
                                 -1,
-                                0x106e08d9 % _PART_CNT,
-                                0x058d780f % _PART_CNT,
-                                0x4f7703da % _PART_CNT,
-                                0x5ec19395 % _PART_CNT
+                                0x106e08d9 % part_cnt,
+                                0x058d780f % part_cnt,
+                                0x4f7703da % part_cnt,
+                                0x5ec19395 % part_cnt
+                        } },
+                { "fnv1a", {
+                                /* .. using https://play.golang.org/p/hRkA4xtYyJ6 */
+                                0x7ee3623b % part_cnt,
+                                0x7ee3623b % part_cnt,
+                                0x27e6f469 % part_cnt,
+                                0x155e3e5f % part_cnt,
+                                0x17b1e27a % part_cnt
+                        } },
+                { "fnv1a_random", {
+                                -1,
+                                0x7ee3623b % part_cnt,
+                                0x27e6f469 % part_cnt,
+                                0x155e3e5f % part_cnt,
+                                0x17b1e27a % part_cnt
                         } },
                 { NULL }
         };
         int pi;
         const char *topic = test_mk_topic_name(__FUNCTION__, 1);
 
-        test_create_topic(topic, _PART_CNT, 1);
+        test_create_topic(NULL, topic, part_cnt, 1);
 
         for (pi = 0 ; ptest[pi].partitioner ; pi++) {
                 do_test_partitioner(topic, ptest[pi].partitioner,

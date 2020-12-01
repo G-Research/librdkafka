@@ -169,7 +169,7 @@ static void do_test_non_exist_and_partchange (void) {
 	await_no_rebalance("#1: empty", rk, queue, 10000);
 
 	TEST_SAY("#1: creating topic %s\n", topic_a);
-	test_create_topic(topic_a, 2, 1);
+	test_create_topic(NULL, topic_a, 2, 1);
 
 	await_assignment("#1: proper", rk, queue, 1,
 			 topic_a, 2);
@@ -228,7 +228,7 @@ static void do_test_regex (void) {
 	queue = rd_kafka_queue_get_consumer(rk);
 
 	TEST_SAY("Regex: creating topic %s (subscribed)\n", topic_b);
-	test_create_topic(topic_b, 2, 1);
+	test_create_topic(NULL, topic_b, 2, 1);
 	rd_sleep(1); // FIXME: do check&wait loop instead
 
 	TEST_SAY("Regex: Subscribing to %s & %s & %s\n",
@@ -239,13 +239,13 @@ static void do_test_regex (void) {
 			 topic_b, 2);
 
 	TEST_SAY("Regex: creating topic %s (not subscribed)\n", topic_c);
-	test_create_topic(topic_c, 4, 1);
+	test_create_topic(NULL, topic_c, 4, 1);
 
 	/* Should not see a rebalance since no topics are matched. */
 	await_no_rebalance("Regex: empty", rk, queue, 10000);
 
 	TEST_SAY("Regex: creating topic %s (subscribed)\n", topic_d);
-	test_create_topic(topic_d, 1, 1);
+	test_create_topic(NULL, topic_d, 1, 1);
 
 	await_revoke("Regex: rebalance after topic creation", rk, queue);
 
@@ -265,13 +265,8 @@ static void do_test_regex (void) {
 }
 
 
-/* @remark This test will fail if auto topic creation is enabled on the broker
- * since the client will issue a topic-creating metadata request to find
- * a new leader when the topic is removed.
- *
- * To run with trivup, do:
- * ./interactive_broker_version.py .. -conf '{"auto_create_topics":"false"}' ..
- * TESTS=0045 ./run-test.sh -k ./merged
+/**
+ * @remark Requires scenario=noautocreate.
  */
 static void do_test_topic_remove (void) {
 	char *topic_f = rd_strdup(test_mk_topic_name("topic_f", 1));
@@ -306,10 +301,10 @@ static void do_test_topic_remove (void) {
 	queue = rd_kafka_queue_get_consumer(rk);
 
 	TEST_SAY("Topic removal: creating topic %s (subscribed)\n", topic_f);
-	test_create_topic(topic_f, parts_f, 1);
+	test_create_topic(NULL, topic_f, parts_f, 1);
 
 	TEST_SAY("Topic removal: creating topic %s (subscribed)\n", topic_g);
-	test_create_topic(topic_g, parts_g, 1);
+	test_create_topic(NULL, topic_g, parts_g, 1);
 
 	rd_sleep(1); // FIXME: do check&wait loop instead
 
@@ -363,11 +358,6 @@ int main_0045_subscribe_update (int argc, char **argv) {
 }
 
 int main_0045_subscribe_update_non_exist_and_partchange (int argc, char **argv){
-        if (test_check_auto_create_topic()) {
-                TEST_SKIP("do_test_non_exist_and_partchange(): "
-                          "topic auto-creation is enabled\n");
-                return 0;
-        }
 
         do_test_non_exist_and_partchange();
 
@@ -376,10 +366,10 @@ int main_0045_subscribe_update_non_exist_and_partchange (int argc, char **argv){
 
 int main_0045_subscribe_update_topic_remove (int argc, char **argv) {
 
-	if (!test_can_create_topics(1))
-		return 0;
+        if (!test_can_create_topics(1))
+                return 0;
 
-	do_test_topic_remove();
+        do_test_topic_remove();
 
         return 0;
 }

@@ -53,8 +53,7 @@ void rd_kafka_buf_destroy_final (rd_kafka_buf_t *rkbuf) {
                 break;
 
         case RD_KAFKAP_Produce:
-                if (rkbuf->rkbuf_u.Produce.s_rktp)
-                        rd_kafka_toppar_destroy(rkbuf->rkbuf_u.Produce.s_rktp);
+                rd_kafka_msgbatch_destroy(&rkbuf->rkbuf_batch);
                 break;
         }
 
@@ -110,7 +109,6 @@ rd_kafka_buf_t *rd_kafka_buf_new0 (int segcnt, size_t size, int flags) {
         rkbuf->rkbuf_flags = flags;
 
         rd_buf_init(&rkbuf->rkbuf_buf, segcnt, size);
-        rd_kafka_msgq_init(&rkbuf->rkbuf_msgq);
         rd_refcnt_init(&rkbuf->rkbuf_refcnt, 1);
 
         return rkbuf;
@@ -136,6 +134,7 @@ rd_kafka_buf_t *rd_kafka_buf_new_request (rd_kafka_broker_t *rkb, int16_t ApiKey
         rd_kafka_broker_keep(rkb);
 
         rkbuf->rkbuf_rel_timeout = rkb->rkb_rk->rk_conf.socket_timeout_ms;
+        rkbuf->rkbuf_max_retries = RD_KAFKA_REQUEST_MAX_RETRIES;
 
         rkbuf->rkbuf_reqhdr.ApiKey = ApiKey;
 
@@ -149,7 +148,7 @@ rd_kafka_buf_t *rd_kafka_buf_new_request (rd_kafka_broker_t *rkb, int16_t ApiKey
         /* CorrId: updated later */
         rd_kafka_buf_write_i32(rkbuf, 0);
 
-        /* ClientId */
+        /* ClientId: possibly updated later if a flexible version */
         rd_kafka_buf_write_kstr(rkbuf, rkb->rkb_rk->rk_client_id);
 
         return rkbuf;
@@ -181,8 +180,6 @@ rd_kafka_buf_t *rd_kafka_buf_new_shadow (const void *ptr, size_t size,
         /* Initialize reader slice */
         rd_slice_init_full(&rkbuf->rkbuf_reader, &rkbuf->rkbuf_buf);
 
-	rd_kafka_msgq_init(&rkbuf->rkbuf_msgq);
-
         rd_refcnt_init(&rkbuf->rkbuf_refcnt, 1);
 
 	return rkbuf;
@@ -192,17 +189,19 @@ rd_kafka_buf_t *rd_kafka_buf_new_shadow (const void *ptr, size_t size,
 
 void rd_kafka_bufq_enq (rd_kafka_bufq_t *rkbufq, rd_kafka_buf_t *rkbuf) {
 	TAILQ_INSERT_TAIL(&rkbufq->rkbq_bufs, rkbuf, rkbuf_link);
-	(void)rd_atomic32_add(&rkbufq->rkbq_cnt, 1);
-        (void)rd_atomic32_add(&rkbufq->rkbq_msg_cnt,
-                              rkbuf->rkbuf_msgq.rkmq_msg_cnt);
+        rd_atomic32_add(&rkbufq->rkbq_cnt, 1);
+        if (rkbuf->rkbuf_reqhdr.ApiKey == RD_KAFKAP_Produce)
+                rd_atomic32_add(&rkbufq->rkbq_msg_cnt,
+                                rd_kafka_msgq_len(&rkbuf->rkbuf_batch.msgq));
 }
 
 void rd_kafka_bufq_deq (rd_kafka_bufq_t *rkbufq, rd_kafka_buf_t *rkbuf) {
 	TAILQ_REMOVE(&rkbufq->rkbq_bufs, rkbuf, rkbuf_link);
 	rd_kafka_assert(NULL, rd_atomic32_get(&rkbufq->rkbq_cnt) > 0);
-	(void)rd_atomic32_sub(&rkbufq->rkbq_cnt, 1);
-        (void)rd_atomic32_sub(&rkbufq->rkbq_msg_cnt,
-                              rkbuf->rkbuf_msgq.rkmq_msg_cnt);
+	rd_atomic32_sub(&rkbufq->rkbq_cnt, 1);
+        if (rkbuf->rkbuf_reqhdr.ApiKey == RD_KAFKAP_Produce)
+                rd_atomic32_sub(&rkbufq->rkbq_msg_cnt,
+                                rd_kafka_msgq_len(&rkbuf->rkbuf_batch.msgq));
 }
 
 void rd_kafka_bufq_init(rd_kafka_bufq_t *rkbufq) {
@@ -275,8 +274,9 @@ void rd_kafka_bufq_connection_reset (rd_kafka_broker_t *rkb,
 					      NULL, rkbuf);
 			break;
                 default:
-                        /* Reset buffer send position */
+                        /* Reset buffer send position and corrid */
                         rd_slice_seek(&rkbuf->rkbuf_reader, 0);
+                        rkbuf->rkbuf_corrid = 0;
                         /* Reset timeout */
                         rd_kafka_buf_calc_timeout(rkb->rkb_rk, rkbuf, now);
                         break;
@@ -351,11 +351,14 @@ void rd_kafka_buf_calc_timeout (const rd_kafka_t *rk, rd_kafka_buf_t *rkbuf,
 int rd_kafka_buf_retry (rd_kafka_broker_t *rkb, rd_kafka_buf_t *rkbuf) {
         int incr_retry = rd_kafka_buf_was_sent(rkbuf) ? 1 : 0;
 
+        /* Don't allow retries of dummy/empty buffers */
+        rd_assert(rd_buf_len(&rkbuf->rkbuf_buf) > 0);
+
         if (unlikely(!rkb ||
 		     rkb->rkb_source == RD_KAFKA_INTERNAL ||
 		     rd_kafka_terminating(rkb->rkb_rk) ||
 		     rkbuf->rkbuf_retries + incr_retry >
-		     rkb->rkb_rk->rk_conf.max_retries))
+		     rkbuf->rkbuf_max_retries))
                 return 0;
 
         /* Absolute timeout, check for expiry. */
@@ -378,6 +381,7 @@ int rd_kafka_buf_retry (rd_kafka_broker_t *rkb, rd_kafka_buf_t *rkbuf) {
  */
 void rd_kafka_buf_handle_op (rd_kafka_op_t *rko, rd_kafka_resp_err_t err) {
         rd_kafka_buf_t *request, *response;
+        rd_kafka_t *rk;
 
         request = rko->rko_u.xbuf.rkbuf;
         rko->rko_u.xbuf.rkbuf = NULL;
@@ -404,9 +408,12 @@ void rd_kafka_buf_handle_op (rd_kafka_op_t *rko, rd_kafka_resp_err_t err) {
         response = request->rkbuf_response; /* May be NULL */
         request->rkbuf_response = NULL;
 
-        rd_kafka_buf_callback(request->rkbuf_rkb->rkb_rk,
-			      request->rkbuf_rkb, err,
-                              response, request);
+        if (!(rk = rko->rko_rk)) {
+                rd_assert(request->rkbuf_rkb != NULL);
+                rk = request->rkbuf_rkb->rkb_rk;
+        }
+
+        rd_kafka_buf_callback(rk, request->rkbuf_rkb, err, response, request);
 }
 
 
@@ -462,4 +469,5 @@ void rd_kafka_buf_callback (rd_kafka_t *rk,
 	if (response)
 		rd_kafka_buf_destroy(response);
 }
+
 

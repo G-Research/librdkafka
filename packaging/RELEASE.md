@@ -15,6 +15,58 @@ Release tag and version format:
 
 
 
+## Write release notes
+
+Go to https://github.com/edenhill/librdkafka/releases and create a new
+release (save as draft), outlining the following sections based on the
+changes since the last release:
+ * What type of release (maintenance or feature release)
+ * A short intro to the release, describing the type of release: maintenance
+   or feature release, as well as fix or feature high-lights.
+ * A section of New features, if any.
+ * A section of Enhancements, if any.
+ * A section of Fixes, if any.
+
+Hint: Use ´git log --oneline vLastReleaseTag..´ to get a list of commits since
+      the last release, filter and sort this list into the above categories,
+      making sure the end result is meaningful to the end-user.
+      Make sure to credit community contributors for their work.
+
+Save this page as Draft until the final tag is created.
+
+The github release asset/artifact checksums will be added later when the
+final tag is pushed.
+
+
+## Update protocol requests and error codes
+
+Check out the latest version of Apache Kafka (not trunk, needs to be a released
+version since protocol may change on trunk).
+
+### Protocol request types
+
+Generate protocol request type codes with:
+
+    $ src/generate_proto.sh ~/src/your-kafka-dir
+
+Cut'n'paste the new defines and strings to `rdkafka_protocol.h` and
+`rdkafka_proto.h`.
+
+### Error codes
+
+Error codes must currently be parsed manually, open
+`clients/src/main/java/org/apache/kafka/common/protocol/Errors.java`
+in the Kafka source directory and update the `rd_kafka_resp_err_t` and
+`RdKafka::ErrorCode` enums in `rdkafka.h` and `rdkafkacpp.h`
+respectively.
+Add the error strings to `rdkafka.c`.
+The Kafka error strings are sometimes a bit too verbose for our taste,
+so feel free to rewrite them (usually removing a couple of 'the's).
+
+**NOTE**: Only add **new** error codes, do not alter existing ones since that
+          will be a breaking API change.
+
+
 ## Run regression tests
 
 **Build tests:**
@@ -84,7 +136,6 @@ for v0.11.1-RC1, or 0x000b01ff for the final v0.11.1 release.
     $ git push --tags origin v0.11.1-RC1
 
 
-
 ## Creating packages
 
 As soon as a tag is pushed the CI systems (Travis and AppVeyor) will
@@ -95,19 +146,43 @@ Wait until this process is finished by monitoring the two CIs:
  * https://ci.appveyor.com/project/edenhill/librdkafka
 
 
+## Publish release on github
+
+Open up the release page on github that was created above.
+
+Run the following command to get checksums of the github release assets:
+
+    $ packaging/tools/gh-release-checksums.py <the-tag>
+
+It will take some time for the script to download the files, when done
+paste the output to the end of the release page.
+
+Make sure the release page looks okay, is still correct (check for new commits),
+and has the correct tag, then click Publish release.
+
+
 ### Create NuGet package
 
 On a Linux host with docker installed, this will also require S3 credentials
 to be set up.
 
     $ cd packaging/nuget
-    $ pip install -r requirements.txt  # if necessary
+    $ pip3 install -r requirements.txt  # if necessary
     $ ./release.py v0.11.1-RC1
 
 Test the generated librdkafka.redist.0.11.1-RC1.nupkg and
 then upload it to NuGet manually:
 
  * https://www.nuget.org/packages/manage/upload
+
+
+### Create static bundle (for Go)
+
+    $ cd packaging/nuget
+    $ ./release.py --class StaticPackage v0.11.1-RC1
+
+Follow the Go client release instructions for updating its bundled librdkafka
+version based on the tar ball created here.
 
 
 ### Homebrew recipe update

@@ -33,15 +33,14 @@
 #include "rdendian.h"
 #include "rdvarint.h"
 
+/* Protocol defines */
+#include "rdkafka_protocol.h"
 
 
-/*
- * Kafka protocol definitions.
- */
 
-#define RD_KAFKA_PORT      9092
-#define RD_KAFKA_PORT_STR "9092"
-
+/** Default generic retry count for failed requests.
+ *  This may be overriden for specific request types. */
+#define RD_KAFKA_REQUEST_MAX_RETRIES 2
 
 /**
  * Request types
@@ -49,51 +48,6 @@
 struct rd_kafkap_reqhdr {
         int32_t  Size;
         int16_t  ApiKey;
-#define RD_KAFKAP_None         -1
-#define RD_KAFKAP_Produce       0
-#define RD_KAFKAP_Fetch         1
-#define RD_KAFKAP_Offset        2
-#define RD_KAFKAP_Metadata      3
-#define RD_KAFKAP_LeaderAndIsr  4
-#define RD_KAFKAP_StopReplica   5
-#define RD_KAFKAP_UpdateMetadata 6
-#define RD_KAFKAP_ControlledShutdown 7
-#define RD_KAFKAP_OffsetCommit  8
-#define RD_KAFKAP_OffsetFetch   9
-#define RD_KAFKAP_GroupCoordinator 10
-#define RD_KAFKAP_JoinGroup     11
-#define RD_KAFKAP_Heartbeat     12
-#define RD_KAFKAP_LeaveGroup    13
-#define RD_KAFKAP_SyncGroup     14
-#define RD_KAFKAP_DescribeGroups 15
-#define RD_KAFKAP_ListGroups    16
-#define RD_KAFKAP_SaslHandshake 17
-#define RD_KAFKAP_ApiVersion    18
-#define RD_KAFKAP_CreateTopics  19
-#define RD_KAFKAP_DeleteTopics  20
-#define RD_KAFKAP_DeleteRecords 21
-#define RD_KAFKAP_InitProducerId 22
-#define RD_KAFKAP_OffsetForLeaderEpoch 23
-#define RD_KAFKAP_AddPartitionsToTxn 24
-#define RD_KAFKAP_AddOffsetsToTxn 25
-#define RD_KAFKAP_EndTxn        26
-#define RD_KAFKAP_WriteTxnMarkers 27
-#define RD_KAFKAP_TxnOffsetCommit 28
-#define RD_KAFKAP_DescribeAcls  29
-#define RD_KAFKAP_CreateAcls    30
-#define RD_KAFKAP_DeleteAcls    31
-#define RD_KAFKAP_DescribeConfigs 32
-#define RD_KAFKAP_AlterConfigs  33
-#define RD_KAFKAP_AlterReplicaLogDirs 34
-#define RD_KAFKAP_DescribeLogDirs 35
-#define RD_KAFKAP_SaslAuthenticate 36
-#define RD_KAFKAP_CreatePartitions 37
-#define RD_KAFKAP_CreateDelegationToken 38
-#define RD_KAFKAP_RenewDelegationToken 39
-#define RD_KAFKAP_ExpireDelegationToken 40
-#define RD_KAFKAP_DescribeDelegationToken 41
-#define RD_KAFKAP_DeleteGroups 42
-#define RD_KAFKAP__NUM         43
         int16_t  ApiVersion;
         int32_t  CorrId;
         /* ClientId follows */
@@ -112,6 +66,11 @@ struct rd_kafkap_reshdr {
 
 
 
+/**
+ * @brief Protocol request type (ApiKey) to name/string.
+ *
+ * Generate updates to this list with generate_proto.sh.
+ */
 static RD_UNUSED
 const char *rd_kafka_ApiKey2str (int16_t ApiKey) {
         static const char *names[] = {
@@ -125,7 +84,7 @@ const char *rd_kafka_ApiKey2str (int16_t ApiKey) {
                 [RD_KAFKAP_ControlledShutdown] = "ControlledShutdown",
                 [RD_KAFKAP_OffsetCommit] = "OffsetCommit",
                 [RD_KAFKAP_OffsetFetch] = "OffsetFetch",
-                [RD_KAFKAP_GroupCoordinator] = "GroupCoordinator",
+                [RD_KAFKAP_FindCoordinator] = "FindCoordinator",
                 [RD_KAFKAP_JoinGroup] = "JoinGroup",
                 [RD_KAFKAP_Heartbeat] = "Heartbeat",
                 [RD_KAFKAP_LeaveGroup] = "LeaveGroup",
@@ -157,8 +116,30 @@ const char *rd_kafka_ApiKey2str (int16_t ApiKey) {
                 [RD_KAFKAP_RenewDelegationToken] = "RenewDelegationToken",
                 [RD_KAFKAP_ExpireDelegationToken] = "ExpireDelegationToken",
                 [RD_KAFKAP_DescribeDelegationToken] = "DescribeDelegationToken",
-                [RD_KAFKAP_DeleteGroups] = "DeleteGroups"
-
+                [RD_KAFKAP_DeleteGroups] = "DeleteGroups",
+                [RD_KAFKAP_ElectLeadersRequest] = "ElectLeadersRequest",
+                [RD_KAFKAP_IncrementalAlterConfigsRequest] =
+                "IncrementalAlterConfigsRequest",
+                [RD_KAFKAP_AlterPartitionReassignmentsRequest] =
+                "AlterPartitionReassignmentsRequest",
+                [RD_KAFKAP_ListPartitionReassignmentsRequest] =
+                "ListPartitionReassignmentsRequest",
+                [RD_KAFKAP_OffsetDeleteRequest] = "OffsetDeleteRequest",
+                [RD_KAFKAP_DescribeClientQuotasRequest] =
+                "DescribeClientQuotasRequest",
+                [RD_KAFKAP_AlterClientQuotasRequest] =
+                "AlterClientQuotasRequest",
+                [RD_KAFKAP_DescribeUserScramCredentialsRequest] =
+                "DescribeUserScramCredentialsRequest",
+                [RD_KAFKAP_AlterUserScramCredentialsRequest] =
+                "AlterUserScramCredentialsRequest",
+                [RD_KAFKAP_VoteRequest] = "VoteRequest",
+                [RD_KAFKAP_BeginQuorumEpochRequest] = "BeginQuorumEpochRequest",
+                [RD_KAFKAP_EndQuorumEpochRequest] = "EndQuorumEpochRequest",
+                [RD_KAFKAP_DescribeQuorumRequest] = "DescribeQuorumRequest",
+                [RD_KAFKAP_AlterIsrRequest] = "AlterIsrRequest",
+                [RD_KAFKAP_UpdateFeaturesRequest] = "UpdateFeaturesRequest",
+                [RD_KAFKAP_EnvelopeRequest] = "EnvelopeRequest",
         };
         static RD_TLS char ret[32];
 
@@ -190,16 +171,35 @@ struct rd_kafka_ApiVersion {
 /**
  * @brief ApiVersion.ApiKey comparator.
  */
-static RD_UNUSED int rd_kafka_ApiVersion_key_cmp (const void *_a, const void *_b) {
-	const struct rd_kafka_ApiVersion *a = _a, *b = _b;
-
-	return a->ApiKey - b->ApiKey;
+static RD_UNUSED
+int rd_kafka_ApiVersion_key_cmp (const void *_a, const void *_b) {
+        const struct rd_kafka_ApiVersion *a =
+                (const struct rd_kafka_ApiVersion *)_a;
+        const struct rd_kafka_ApiVersion *b =
+                (const struct rd_kafka_ApiVersion *)_b;
+        return RD_CMP(a->ApiKey, b->ApiKey);
 }
 
 
 
-#define RD_KAFKAP_READ_UNCOMMITTED  0
-#define RD_KAFKAP_READ_COMMITTED    1
+typedef enum {
+        RD_KAFKA_READ_UNCOMMITTED = 0,
+        RD_KAFKA_READ_COMMITTED = 1
+} rd_kafka_isolation_level_t;
+
+
+
+#define RD_KAFKA_CTRL_MSG_ABORT 0
+#define RD_KAFKA_CTRL_MSG_COMMIT 1
+
+
+/**
+ * @enum Coordinator type, used with FindCoordinatorRequest
+ */
+typedef enum rd_kafka_coordtype_t {
+        RD_KAFKA_COORD_GROUP = 0,
+        RD_KAFKA_COORD_TXN = 1
+} rd_kafka_coordtype_t;
 
 
 /**
@@ -230,7 +230,12 @@ typedef struct rd_kafkap_str_s {
 #define RD_KAFKAP_STR_SIZE(kstr) RD_KAFKAP_STR_SIZE0((kstr)->len)
 
 
-/* Serialized Kafka string: only works for _new() kstrs */
+/** @returns true if kstr is pre-serialized through .._new() */
+#define RD_KAFKAP_STR_IS_SERIALIZED(kstr)                               \
+        (((const char *)((kstr)+1))+2 == (const char *)((kstr)->str))
+
+/* Serialized Kafka string: only works for _new() kstrs.
+ * Check with RD_KAFKAP_STR_IS_SERIALIZED */
 #define RD_KAFKAP_STR_SER(kstr)  ((kstr)+1)
 
 /* Macro suitable for "%.*s" printing. */
@@ -271,17 +276,17 @@ rd_kafkap_str_t *rd_kafkap_str_new (const char *str, int len) {
 	if (!str)
 		len = RD_KAFKAP_STR_LEN_NULL;
 	else if (len == -1)
-		len = str ? (int)strlen(str) : RD_KAFKAP_STR_LEN_NULL;
+		len = (int)strlen(str);
 
-	kstr = rd_malloc(sizeof(*kstr) + 2 +
-			 (len == RD_KAFKAP_STR_LEN_NULL ? 0 : len + 1));
+	kstr = (rd_kafkap_str_t *)rd_malloc(sizeof(*kstr) + 2 +
+			(len == RD_KAFKAP_STR_LEN_NULL ? 0 : len + 1));
 	kstr->len = len;
 
 	/* Serialised format: 16-bit string length */
 	klen = htobe16(len);
 	memcpy(kstr+1, &klen, 2);
 
-	/* Serialised format: non null-terminated string */
+	/* Pre-Serialised format: non null-terminated string */
 	if (len == RD_KAFKAP_STR_LEN_NULL)
 		kstr->str = NULL;
 	else {
@@ -310,7 +315,7 @@ static RD_INLINE RD_UNUSED int rd_kafkap_str_cmp (const rd_kafkap_str_t *a,
 	if (r)
 		return r;
 	else
-		return a->len - b->len;
+                return RD_CMP(a->len, b->len);
 }
 
 static RD_INLINE RD_UNUSED int rd_kafkap_str_cmp_str (const rd_kafkap_str_t *a,
@@ -321,7 +326,7 @@ static RD_INLINE RD_UNUSED int rd_kafkap_str_cmp_str (const rd_kafkap_str_t *a,
 	if (r)
 		return r;
 	else
-		return a->len - len;
+                return RD_CMP(a->len, len);
 }
 
 static RD_INLINE RD_UNUSED int rd_kafkap_str_cmp_str2 (const char *str,
@@ -332,7 +337,7 @@ static RD_INLINE RD_UNUSED int rd_kafkap_str_cmp_str2 (const char *str,
 	if (r)
 		return r;
 	else
-		return len - b->len;
+                return RD_CMP(len, b->len);
 }
 
 
@@ -366,6 +371,9 @@ typedef struct rd_kafkap_bytes_s {
 #define RD_KAFKAP_BYTES_SIZE0(len) (4 + RD_KAFKAP_BYTES_LEN0(len))
 #define RD_KAFKAP_BYTES_SIZE(kbytes) RD_KAFKAP_BYTES_SIZE0((kbytes)->len)
 
+/** @returns true if kbyes is pre-serialized through .._new() */
+#define RD_KAFKAP_BYTES_IS_SERIALIZED(kstr)                             \
+        (((const char *)((kbytes)+1))+2 == (const char *)((kbytes)->data))
 
 /* Serialized Kafka bytes: only works for _new() kbytes */
 #define RD_KAFKAP_BYTES_SER(kbytes)  ((kbytes)+1)
@@ -398,12 +406,12 @@ rd_kafkap_bytes_t *rd_kafkap_bytes_new (const char *bytes, int32_t len) {
 	if (!bytes && !len)
 		len = RD_KAFKAP_BYTES_LEN_NULL;
 
-	kbytes = rd_malloc(sizeof(*kbytes) + 4 +
-			 (len == RD_KAFKAP_BYTES_LEN_NULL ? 0 : len));
+	kbytes = (rd_kafkap_bytes_t *)rd_malloc(sizeof(*kbytes) + 4 +
+			(len == RD_KAFKAP_BYTES_LEN_NULL ? 0 : len));
 	kbytes->len = len;
 
 	klen = htobe32(len);
-	memcpy(kbytes+1, &klen, 4);
+	memcpy((void *)(kbytes+1), &klen, 4);
 
 	if (len == RD_KAFKAP_BYTES_LEN_NULL)
 		kbytes->data = NULL;
@@ -423,7 +431,8 @@ rd_kafkap_bytes_t *rd_kafkap_bytes_new (const char *bytes, int32_t len) {
  */
 static RD_INLINE RD_UNUSED
 rd_kafkap_bytes_t *rd_kafkap_bytes_copy (const rd_kafkap_bytes_t *src) {
-        return rd_kafkap_bytes_new(src->data, src->len);
+        return rd_kafkap_bytes_new(
+                (const char *)src->data, src->len);
 }
 
 
@@ -434,7 +443,7 @@ static RD_INLINE RD_UNUSED int rd_kafkap_bytes_cmp (const rd_kafkap_bytes_t *a,
 	if (r)
 		return r;
 	else
-		return a->len - b->len;
+                return RD_CMP(a->len, b->len);
 }
 
 static RD_INLINE RD_UNUSED
@@ -445,7 +454,7 @@ int rd_kafkap_bytes_cmp_data (const rd_kafkap_bytes_t *a,
 	if (r)
 		return r;
 	else
-		return a->len - len;
+                return RD_CMP(a->len, len);
 }
 
 
@@ -481,7 +490,7 @@ typedef struct rd_kafka_buf_s rd_kafka_buf_t;
 /**
  * MsgVersion v2
  */
-#define RD_KAFKAP_MESSAGE_V2_OVERHEAD                                  \
+#define RD_KAFKAP_MESSAGE_V2_MAX_OVERHEAD                              \
         (                                                              \
         /* Length (varint) */                                          \
         RD_UVARINT_ENC_SIZEOF(int32_t) +                               \
@@ -499,6 +508,23 @@ typedef struct rd_kafka_buf_s rd_kafka_buf_t;
         RD_UVARINT_ENC_SIZEOF(int32_t)                                 \
         )
 
+#define RD_KAFKAP_MESSAGE_V2_MIN_OVERHEAD                              \
+        (                                                              \
+        /* Length (varint) */                                          \
+        RD_UVARINT_ENC_SIZE_0() +                                      \
+        /* Attributes */                                               \
+        1 +                                                            \
+        /* TimestampDelta (varint) */                                  \
+        RD_UVARINT_ENC_SIZE_0() +                                      \
+        /* OffsetDelta (varint) */                                     \
+        RD_UVARINT_ENC_SIZE_0() +                                      \
+        /* KeyLen (varint) */                                          \
+        RD_UVARINT_ENC_SIZE_0() +                                      \
+        /* ValueLen (varint) */                                        \
+        RD_UVARINT_ENC_SIZE_0() +                                      \
+        /* HeaderCnt (varint): */                                      \
+        RD_UVARINT_ENC_SIZE_0()                                        \
+        )
 
 
 /**
@@ -572,7 +598,7 @@ rd_kafka_pid2str (const rd_kafka_pid_t pid) {
         i = (i + 1) % 2;
 
         rd_snprintf(buf[i], sizeof(buf[i]),
-                    "PID{Id:%"PRId64",Epoch:%hd}", pid.id, pid.epoch);
+                    "PID{Id:%" PRId64",Epoch:%hd}", pid.id, pid.epoch);
 
         return buf[i];
 }
@@ -591,8 +617,10 @@ static RD_UNUSED RD_INLINE void rd_kafka_pid_reset (rd_kafka_pid_t *pid) {
  */
 static RD_UNUSED RD_INLINE rd_kafka_pid_t
 rd_kafka_pid_bump (const rd_kafka_pid_t old) {
-        rd_kafka_pid_t new = { old.id, ((int)old.epoch + 1) & (int)INT16_MAX };
-        return new;
+        rd_kafka_pid_t new_pid = {
+                old.id,
+                (int16_t)(((int)old.epoch + 1) & (int)INT16_MAX) };
+        return new_pid;
 }
 
 /**@}*/

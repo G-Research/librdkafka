@@ -227,6 +227,20 @@ int rd_list_remove_multi_cmp (rd_list_t *rl, void *match_elem,
 }
 
 
+void *rd_list_pop (rd_list_t *rl) {
+        void *elem;
+        int idx = rl->rl_cnt - 1;
+
+        if (idx < 0)
+                return NULL;
+
+        elem = rl->rl_elems[idx];
+        rd_list_remove_elem(rl, idx);
+
+        return elem;
+}
+
+
 /**
  * Trampoline to avoid the double pointers in callbacks.
  *
@@ -246,6 +260,9 @@ int rd_list_cmp_trampoline (const void *_a, const void *_b) {
 }
 
 void rd_list_sort (rd_list_t *rl, int (*cmp) (const void *, const void *)) {
+        if (unlikely(rl->rl_elems == NULL))
+                return;
+
 	rd_list_cmp_curr = cmp;
         qsort(rl->rl_elems, rl->rl_cnt, sizeof(*rl->rl_elems),
 	      rd_list_cmp_trampoline);
@@ -322,11 +339,25 @@ void *rd_list_find (const rd_list_t *rl, const void *match,
 }
 
 
-int rd_list_cmp (const rd_list_t *a, rd_list_t *b,
+void *rd_list_first (const rd_list_t *rl) {
+        if (rl->rl_cnt == 0)
+                return NULL;
+        return rl->rl_elems[0];
+}
+
+void *rd_list_last (const rd_list_t *rl) {
+        if (rl->rl_cnt == 0)
+                return NULL;
+        return rl->rl_elems[rl->rl_cnt-1];
+}
+
+
+
+int rd_list_cmp (const rd_list_t *a, const rd_list_t *b,
 		 int (*cmp) (const void *, const void *)) {
 	int i;
 
-	i = a->rl_cnt - b->rl_cnt;
+	i = RD_CMP(a->rl_cnt, b->rl_cnt);
 	if (i)
 		return i;
 
@@ -344,13 +375,12 @@ int rd_list_cmp (const rd_list_t *a, rd_list_t *b,
  * @brief Simple element pointer comparator
  */
 int rd_list_cmp_ptr (const void *a, const void *b) {
-        if (a < b)
-                return -1;
-        else if (a > b)
-                return 1;
-        return 0;
+        return RD_CMP(a, b);
 }
 
+int rd_list_cmp_str (const void *a, const void *b) {
+        return strcmp((const char *)a, (const char *)b);
+}
 
 void rd_list_apply (rd_list_t *rl,
                     int (*cb) (void *elem, void *opaque), void *opaque) {

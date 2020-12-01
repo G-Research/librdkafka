@@ -37,9 +37,13 @@
 #include "rdkafka_metadata.h"
 #include "rdkafka_msgset.h"
 #include "rdkafka_idempotence.h"
+#include "rdkafka_txnmgr.h"
+#include "rdkafka_sasl.h"
 
 #include "rdrand.h"
 #include "rdstring.h"
+#include "rdunittest.h"
+
 
 /**
  * Kafka protocol request and response handling.
@@ -82,8 +86,7 @@ static const char *rd_kafka_actions2str (int actions) {
  */
 int rd_kafka_err_action (rd_kafka_broker_t *rkb,
 			 rd_kafka_resp_err_t err,
-			 rd_kafka_buf_t *rkbuf,
-			 rd_kafka_buf_t *request, ...) {
+			 const rd_kafka_buf_t *request, ...) {
 	va_list ap;
         int actions = 0;
 	int exp_act;
@@ -123,11 +126,18 @@ int rd_kafka_err_action (rd_kafka_broker_t *rkb,
         case RD_KAFKA_RESP_ERR_NOT_LEADER_FOR_PARTITION:
         case RD_KAFKA_RESP_ERR_BROKER_NOT_AVAILABLE:
         case RD_KAFKA_RESP_ERR_REPLICA_NOT_AVAILABLE:
-        case RD_KAFKA_RESP_ERR_GROUP_COORDINATOR_NOT_AVAILABLE:
-        case RD_KAFKA_RESP_ERR_NOT_COORDINATOR_FOR_GROUP:
+        case RD_KAFKA_RESP_ERR_COORDINATOR_NOT_AVAILABLE:
+        case RD_KAFKA_RESP_ERR_NOT_COORDINATOR:
         case RD_KAFKA_RESP_ERR__WAIT_COORD:
                 /* Request metadata information update */
                 actions |= RD_KAFKA_ERR_ACTION_REFRESH|
+                        RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED;
+                break;
+
+        case RD_KAFKA_RESP_ERR_KAFKA_STORAGE_ERROR:
+                /* Request metadata update and retry */
+                actions |= RD_KAFKA_ERR_ACTION_REFRESH|
+                        RD_KAFKA_ERR_ACTION_RETRY|
                         RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED;
                 break;
 
@@ -147,6 +157,13 @@ int rd_kafka_err_action (rd_kafka_broker_t *rkb,
                 break;
 
         case RD_KAFKA_RESP_ERR__PURGE_INFLIGHT:
+                actions |= RD_KAFKA_ERR_ACTION_PERMANENT|
+                        RD_KAFKA_ERR_ACTION_MSG_POSSIBLY_PERSISTED;
+                break;
+
+        case RD_KAFKA_RESP_ERR__BAD_MSG:
+                /* Buffer parse failures are typically a client-side bug,
+                 * treat them as permanent failures. */
                 actions |= RD_KAFKA_ERR_ACTION_PERMANENT|
                         RD_KAFKA_ERR_ACTION_MSG_POSSIBLY_PERSISTED;
                 break;
@@ -181,20 +198,193 @@ int rd_kafka_err_action (rd_kafka_broker_t *rkb,
 
 
 /**
- * Send GroupCoordinatorRequest
+ * @brief Read a list of topic+partitions+extra from \p rkbuf.
+ *
+ * @param rkbuf buffer to read from
+ * @param estimated_part_cnt estimated number of partitions to read.
+ * @param read_part_errs whether or not to read an error per partition.
+ *
+ * @returns a newly allocated list on success, or NULL on parse error.
  */
-void rd_kafka_GroupCoordinatorRequest (rd_kafka_broker_t *rkb,
-                                       const rd_kafkap_str_t *cgrp,
-                                       rd_kafka_replyq_t replyq,
-                                       rd_kafka_resp_cb_t *resp_cb,
-                                       void *opaque) {
-        rd_kafka_buf_t *rkbuf;
+rd_kafka_topic_partition_list_t *
+rd_kafka_buf_read_topic_partitions (rd_kafka_buf_t *rkbuf,
+                                    size_t estimated_part_cnt,
+                                    rd_bool_t read_part_errs) {
+        const int log_decode_errors = LOG_ERR;
+        int16_t ErrorCode = 0;
+        int32_t TopicArrayCnt;
+        rd_kafka_topic_partition_list_t *parts = NULL;
 
-        rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_GroupCoordinator, 1,
-                                         RD_KAFKAP_STR_SIZE(cgrp));
-        rd_kafka_buf_write_kstr(rkbuf, cgrp);
+        rd_kafka_buf_read_i32(rkbuf, &TopicArrayCnt);
+        if ((size_t)TopicArrayCnt > RD_KAFKAP_TOPICS_MAX)
+                rd_kafka_buf_parse_fail(rkbuf,
+                                        "TopicArrayCnt %"PRId32" out of range",
+                                        TopicArrayCnt);
+
+        parts = rd_kafka_topic_partition_list_new(
+                RD_MAX(TopicArrayCnt, (int)estimated_part_cnt));
+
+        while (TopicArrayCnt-- > 0) {
+                rd_kafkap_str_t kTopic;
+                int32_t PartArrayCnt;
+                char *topic;
+
+                rd_kafka_buf_read_str(rkbuf, &kTopic);
+                rd_kafka_buf_read_i32(rkbuf, &PartArrayCnt);
+
+                RD_KAFKAP_STR_DUPA(&topic, &kTopic);
+
+                while (PartArrayCnt-- > 0) {
+                        int32_t Partition;
+                        rd_kafka_topic_partition_t *rktpar;
+
+                        rd_kafka_buf_read_i32(rkbuf, &Partition);
+
+                        rktpar = rd_kafka_topic_partition_list_add(
+                                parts, topic, Partition);
+
+                        if (read_part_errs) {
+                                rd_kafka_buf_read_i16(rkbuf, &ErrorCode);
+                                rktpar->err = ErrorCode;
+                        }
+                }
+        }
+
+        return parts;
+
+ err_parse:
+        if (parts)
+                rd_kafka_topic_partition_list_destroy(parts);
+
+        return NULL;
+}
+
+
+/**
+ * @brief Write a list of topic+partitions+offsets+extra to \p rkbuf
+ *
+ * @returns the number of partitions written to buffer.
+ *
+ * @remark The \p parts list MUST be sorted.
+ */
+int rd_kafka_buf_write_topic_partitions (
+        rd_kafka_buf_t *rkbuf,
+        const rd_kafka_topic_partition_list_t *parts,
+        rd_bool_t skip_invalid_offsets,
+        rd_bool_t write_Offset,
+        rd_bool_t write_Epoch,
+        rd_bool_t write_Metadata) {
+        size_t of_TopicArrayCnt;
+        size_t of_PartArrayCnt = 0;
+        int TopicArrayCnt = 0, PartArrayCnt = 0;
+        int i;
+        const char *last_topic = NULL;
+        int cnt = 0;
+
+        /* TopicArrayCnt */
+        of_TopicArrayCnt = rd_kafka_buf_write_i32(rkbuf, 0); /* updated later */
+
+        for (i = 0 ; i < parts->cnt ; i++) {
+                const rd_kafka_topic_partition_t *rktpar = &parts->elems[i];
+
+                if (skip_invalid_offsets && rktpar->offset < 0)
+                        continue;
+
+                if (!last_topic || strcmp(rktpar->topic, last_topic)) {
+                        /* Finish last topic, if any. */
+                        if (of_PartArrayCnt > 0)
+                                rd_kafka_buf_update_i32(rkbuf,
+                                                        of_PartArrayCnt,
+                                                        PartArrayCnt);
+
+                        /* Topic */
+                        rd_kafka_buf_write_str(rkbuf, rktpar->topic, -1);
+                        TopicArrayCnt++;
+                        last_topic = rktpar->topic;
+                        /* New topic so reset partition count */
+                        PartArrayCnt = 0;
+
+                        /* PartitionArrayCnt: updated later */
+                        of_PartArrayCnt = rd_kafka_buf_write_i32(rkbuf, 0);
+                }
+
+                /* Partition */
+                rd_kafka_buf_write_i32(rkbuf, rktpar->partition);
+                PartArrayCnt++;
+
+                /* Time/Offset */
+                if (write_Offset) {
+                        if (rktpar->offset >= 0)
+                                rd_kafka_buf_write_i64(rkbuf, rktpar->offset);
+                        else
+                                rd_kafka_buf_write_i64(rkbuf, -1);
+                }
+
+                if (write_Epoch) {
+                        /* CommittedLeaderEpoch */
+                        rd_kafka_buf_write_i32(rkbuf, -1);
+                }
+
+                if (write_Metadata) {
+                        /* Metadata */
+                        /* Java client 0.9.0 and broker <0.10.0 can't parse
+                         * Null metadata fields, so as a workaround we send an
+                         * empty string if it's Null. */
+                        if (!rktpar->metadata)
+                                rd_kafka_buf_write_str(rkbuf, "", 0);
+                        else
+                                rd_kafka_buf_write_str(rkbuf,
+                                                       rktpar->metadata,
+                                                       rktpar->metadata_size);
+                }
+
+                cnt++;
+        }
+
+        if (of_PartArrayCnt > 0) {
+                rd_kafka_buf_update_i32(rkbuf, of_PartArrayCnt, PartArrayCnt);
+                rd_kafka_buf_update_i32(rkbuf, of_TopicArrayCnt, TopicArrayCnt);
+        }
+
+        return cnt;
+}
+
+
+/**
+ * @brief Send FindCoordinatorRequest.
+ *
+ * @param coordkey is the group.id for RD_KAFKA_COORD_GROUP,
+ *                 and the transactional.id for RD_KAFKA_COORD_TXN
+ */
+rd_kafka_resp_err_t
+rd_kafka_FindCoordinatorRequest (rd_kafka_broker_t *rkb,
+                                 rd_kafka_coordtype_t coordtype,
+                                 const char *coordkey,
+                                 rd_kafka_replyq_t replyq,
+                                 rd_kafka_resp_cb_t *resp_cb,
+                                 void *opaque) {
+        rd_kafka_buf_t *rkbuf;
+        int16_t ApiVersion;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                rkb, RD_KAFKAP_FindCoordinator, 0, 2, NULL);
+
+        if (coordtype != RD_KAFKA_COORD_GROUP && ApiVersion < 1)
+                return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+
+        rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_FindCoordinator, 1,
+                                         1 + 2 + strlen(coordkey));
+
+        rd_kafka_buf_write_str(rkbuf, coordkey, -1);
+
+        if (ApiVersion >= 1)
+                rd_kafka_buf_write_i8(rkbuf, (int8_t)coordtype);
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
+
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
 }
 
 
@@ -279,12 +469,18 @@ rd_kafka_resp_err_t rd_kafka_handle_Offset (rd_kafka_t *rk,
         ErrorCode = rkbuf->rkbuf_err;
  err:
         actions = rd_kafka_err_action(
-                rkb, ErrorCode, rkbuf, request,
+                rkb, ErrorCode, request,
                 RD_KAFKA_ERR_ACTION_PERMANENT,
                 RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART,
 
-                RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_RETRY,
+                RD_KAFKA_ERR_ACTION_REFRESH,
                 RD_KAFKA_RESP_ERR_NOT_LEADER_FOR_PARTITION,
+
+                RD_KAFKA_ERR_ACTION_REFRESH,
+                RD_KAFKA_RESP_ERR_REPLICA_NOT_AVAILABLE,
+
+                RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_RETRY,
+                RD_KAFKA_RESP_ERR_LEADER_NOT_AVAILABLE,
 
                 RD_KAFKA_ERR_ACTION_END);
 
@@ -294,8 +490,8 @@ rd_kafka_resp_err_t rd_kafka_handle_Offset (rd_kafka_t *rk,
                 rd_snprintf(tmp, sizeof(tmp),
                             "OffsetRequest failed: %s",
                             rd_kafka_err2str(ErrorCode));
-                rd_kafka_metadata_refresh_known_topics(rk, NULL, 1/*force*/,
-                                                       tmp);
+                rd_kafka_metadata_refresh_known_topics(rk, NULL,
+                                                       rd_true/*force*/, tmp);
         }
 
         if (actions & RD_KAFKA_ERR_ACTION_RETRY) {
@@ -402,16 +598,21 @@ void rd_kafka_OffsetRequest (rd_kafka_broker_t *rkb,
  * Offsets for included partitions will be propagated through the passed
  * 'offsets' list.
  *
- * \p update_toppar: update toppar's committed_offset
+ * @param rkbuf response buffer, may be NULL if \p err is set.
+ * @param update_toppar update toppar's committed_offset
+ * @param add_part if true add partitions from the response to \p *offsets,
+ *                 else just update the partitions that are already
+ *                 in \p *offsets.
  */
 rd_kafka_resp_err_t
 rd_kafka_handle_OffsetFetch (rd_kafka_t *rk,
-			     rd_kafka_broker_t *rkb,
-			     rd_kafka_resp_err_t err,
-			     rd_kafka_buf_t *rkbuf,
-			     rd_kafka_buf_t *request,
-			     rd_kafka_topic_partition_list_t *offsets,
-			     int update_toppar) {
+                             rd_kafka_broker_t *rkb,
+                             rd_kafka_resp_err_t err,
+                             rd_kafka_buf_t *rkbuf,
+                             rd_kafka_buf_t *request,
+                             rd_kafka_topic_partition_list_t **offsets,
+                             rd_bool_t update_toppar,
+                             rd_bool_t add_part) {
         const int log_decode_errors = LOG_ERR;
         int32_t TopicArrayCnt;
         int64_t offset = RD_KAFKA_OFFSET_INVALID;
@@ -423,10 +624,13 @@ rd_kafka_handle_OffsetFetch (rd_kafka_t *rk,
         if (err)
                 goto err;
 
+        if (!*offsets)
+                *offsets = rd_kafka_topic_partition_list_new(16);
+
         /* Set default offset for all partitions. */
-        rd_kafka_topic_partition_list_set_offsets(rkb->rkb_rk, offsets, 0,
+        rd_kafka_topic_partition_list_set_offsets(rkb->rkb_rk, *offsets, 0,
                                                   RD_KAFKA_OFFSET_INVALID,
-						  0 /* !is commit */);
+                                                  0 /* !is commit */);
 
         rd_kafka_buf_read_i32(rkbuf, &TopicArrayCnt);
         for (i = 0 ; i < TopicArrayCnt ; i++) {
@@ -442,7 +646,7 @@ rd_kafka_handle_OffsetFetch (rd_kafka_t *rk,
 
                 for (j = 0 ; j < PartArrayCnt ; j++) {
                         int32_t partition;
-                        shptr_rd_kafka_toppar_t *s_rktp;
+                        rd_kafka_toppar_t *rktp;
                         rd_kafka_topic_partition_t *rktpar;
                         int16_t err2;
 
@@ -451,10 +655,13 @@ rd_kafka_handle_OffsetFetch (rd_kafka_t *rk,
                         rd_kafka_buf_read_str(rkbuf, &metadata);
                         rd_kafka_buf_read_i16(rkbuf, &err2);
 
-                        rktpar = rd_kafka_topic_partition_list_find(offsets,
+                        rktpar = rd_kafka_topic_partition_list_find(*offsets,
                                                                     topic_name,
                                                                     partition);
-                        if (!rktpar) {
+                        if (!rktpar && add_part)
+                                rktpar = rd_kafka_topic_partition_list_add(
+                                        *offsets, topic_name, partition);
+                        else if (!rktpar) {
 				rd_rkb_dbg(rkb, TOPIC, "OFFSETFETCH",
 					   "OffsetFetchResponse: %s [%"PRId32"] "
 					   "not found in local list: ignoring",
@@ -464,12 +671,12 @@ rd_kafka_handle_OffsetFetch (rd_kafka_t *rk,
 
                         seen_cnt++;
 
-			if (!(s_rktp = rktpar->_private)) {
-				s_rktp = rd_kafka_toppar_get2(rkb->rkb_rk,
-							      topic_name,
-							      partition, 0, 0);
+			if (!(rktp = rktpar->_private)) {
+				rktp = rd_kafka_toppar_get2(rkb->rkb_rk,
+                                                            topic_name,
+                                                            partition, 0, 0);
 				/* May be NULL if topic is not locally known */
-				rktpar->_private = s_rktp;
+				rktpar->_private = rktp;
 			}
 
 			/* broker reports invalid offset as -1 */
@@ -479,12 +686,13 @@ rd_kafka_handle_OffsetFetch (rd_kafka_t *rk,
 				rktpar->offset = offset;
                         rktpar->err = err2;
 
-			rd_rkb_dbg(rkb, TOPIC, "OFFSETFETCH",
-				   "OffsetFetchResponse: %s [%"PRId32"] offset %"PRId64,
-				   topic_name, partition, offset);
+                        rd_rkb_dbg(rkb, TOPIC, "OFFSETFETCH",
+                                   "OffsetFetchResponse: %s [%"PRId32"] "
+                                   "offset %"PRId64", metadata %d byte(s)",
+                                   topic_name, partition, offset,
+                                   RD_KAFKAP_STR_LEN(&metadata));
 
-			if (update_toppar && !err2 && s_rktp) {
-				rd_kafka_toppar_t *rktp = rd_kafka_toppar_s2i(s_rktp);
+			if (update_toppar && !err2 && rktp) {
 				/* Update toppar's committed offset */
 				rd_kafka_toppar_lock(rktp);
 				rktp->rktp_committed_offset = rktpar->offset;
@@ -507,13 +715,17 @@ rd_kafka_handle_OffsetFetch (rd_kafka_t *rk,
         }
 
 
-err:
-        rd_rkb_dbg(rkb, TOPIC, "OFFFETCH",
-                   "OffsetFetch for %d/%d partition(s) returned %s",
-                   seen_cnt,
-                   offsets ? offsets->cnt : -1, rd_kafka_err2str(err));
+ err:
+        if (!*offsets)
+                rd_rkb_dbg(rkb, TOPIC, "OFFFETCH",
+                           "OffsetFetch returned %s", rd_kafka_err2str(err));
+        else
+                rd_rkb_dbg(rkb, TOPIC, "OFFFETCH",
+                           "OffsetFetch for %d/%d partition(s) returned %s",
+                           seen_cnt,
+                           (*offsets)->cnt, rd_kafka_err2str(err));
 
-        actions = rd_kafka_err_action(rkb, err, rkbuf, request,
+        actions = rd_kafka_err_action(rkb, err, request,
 				      RD_KAFKA_ERR_ACTION_END);
 
         if (actions & RD_KAFKA_ERR_ACTION_REFRESH) {
@@ -582,7 +794,9 @@ void rd_kafka_op_handle_OffsetFetch (rd_kafka_t *rk,
         if (rkbuf) {
                 /* ..else parse the response (or perror) */
                 err = rd_kafka_handle_OffsetFetch(rkb->rkb_rk, rkb, err, rkbuf,
-                                                  request, offsets, 0);
+                                                  request, &offsets,
+                                                  rd_false/*dont update rktp*/,
+                                                  rd_false/*dont add part*/);
                 if (err == RD_KAFKA_RESP_ERR__IN_PROGRESS) {
                         rd_kafka_topic_partition_list_destroy(offsets);
                         return; /* Retrying */
@@ -594,8 +808,7 @@ void rd_kafka_op_handle_OffsetFetch (rd_kafka_t *rk,
         rko_reply->rko_u.offset_fetch.partitions = offsets;
         rko_reply->rko_u.offset_fetch.do_free = 1;
 	if (rko->rko_rktp)
-		rko_reply->rko_rktp = rd_kafka_toppar_keep(
-			rd_kafka_toppar_s2i(rko->rko_rktp));
+		rko_reply->rko_rktp = rd_kafka_toppar_keep(rko->rko_rktp);
 
 	rd_kafka_replyq_enq(&rko->rko_replyq, rko_reply, 0);
 
@@ -714,25 +927,100 @@ void rd_kafka_OffsetFetchRequest (rd_kafka_broker_t *rkb,
 }
 
 
+
 /**
+ * @brief Handle per-partition OffsetCommit errors and returns actions flags.
+ */
+static int rd_kafka_handle_OffsetCommit_error (
+        rd_kafka_broker_t *rkb, rd_kafka_buf_t *request,
+        const rd_kafka_topic_partition_t *rktpar) {
+
+        /* These actions are mimicking AK's ConsumerCoordinator.java */
+
+        return rd_kafka_err_action(
+                rkb, rktpar->err, request,
+
+                RD_KAFKA_ERR_ACTION_PERMANENT,
+                RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
+
+                RD_KAFKA_ERR_ACTION_PERMANENT,
+                RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+
+
+                RD_KAFKA_ERR_ACTION_PERMANENT,
+                RD_KAFKA_RESP_ERR_OFFSET_METADATA_TOO_LARGE,
+
+                RD_KAFKA_ERR_ACTION_PERMANENT,
+                RD_KAFKA_RESP_ERR_INVALID_COMMIT_OFFSET_SIZE,
+
+
+                RD_KAFKA_ERR_ACTION_RETRY,
+                RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS,
+
+                RD_KAFKA_ERR_ACTION_RETRY,
+                RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART,
+
+
+                /* .._SPECIAL: mark coordinator dead */
+                RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_SPECIAL,
+                RD_KAFKA_RESP_ERR_COORDINATOR_NOT_AVAILABLE,
+
+                RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_SPECIAL,
+                RD_KAFKA_RESP_ERR_NOT_COORDINATOR,
+
+                RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_SPECIAL,
+                RD_KAFKA_RESP_ERR_REQUEST_TIMED_OUT,
+
+
+                /* FIXME: There are some cases in the Java code where
+                 *        this is not treated as a fatal error. */
+                RD_KAFKA_ERR_ACTION_PERMANENT|RD_KAFKA_ERR_ACTION_FATAL,
+                RD_KAFKA_RESP_ERR_FENCED_INSTANCE_ID,
+
+
+                RD_KAFKA_ERR_ACTION_PERMANENT,
+                RD_KAFKA_RESP_ERR_REBALANCE_IN_PROGRESS,
+
+
+                RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_RETRY,
+                RD_KAFKA_RESP_ERR_UNKNOWN_MEMBER_ID,
+
+                RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_RETRY,
+                RD_KAFKA_RESP_ERR_ILLEGAL_GENERATION,
+
+                RD_KAFKA_ERR_ACTION_END);
+}
+
+
+/**
+ * @brief Handle OffsetCommit response.
+ *
  * @remark \p offsets may be NULL if \p err is set
+ *
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR if all partitions were successfully
+ *          committed,
+ *          RD_KAFKA_RESP_ERR__IN_PROGRESS if a retry was scheduled,
+ *          or any other error code if the request was not retried.
  */
 rd_kafka_resp_err_t
 rd_kafka_handle_OffsetCommit (rd_kafka_t *rk,
-			      rd_kafka_broker_t *rkb,
-			      rd_kafka_resp_err_t err,
-			      rd_kafka_buf_t *rkbuf,
-			      rd_kafka_buf_t *request,
-			      rd_kafka_topic_partition_list_t *offsets) {
+                              rd_kafka_broker_t *rkb,
+                              rd_kafka_resp_err_t err,
+                              rd_kafka_buf_t *rkbuf,
+                              rd_kafka_buf_t *request,
+                              rd_kafka_topic_partition_list_t *offsets) {
         const int log_decode_errors = LOG_ERR;
         int32_t TopicArrayCnt;
-        int16_t ErrorCode = 0, last_ErrorCode = 0;
-	int errcnt = 0;
+        int errcnt = 0;
+        int partcnt = 0;
         int i;
-	int actions;
+        int actions = 0;
 
         if (err)
-		goto err;
+                goto err;
+
+        if (request->rkbuf_reqhdr.ApiVersion >= 3)
+                rd_kafka_buf_read_throttle_time(rkbuf);
 
         rd_kafka_buf_read_i32(rkbuf, &TopicArrayCnt);
         for (i = 0 ; i < TopicArrayCnt ; i++) {
@@ -748,6 +1036,7 @@ rd_kafka_handle_OffsetCommit (rd_kafka_t *rk,
 
                 for (j = 0 ; j < PartArrayCnt ; j++) {
                         int32_t partition;
+                        int16_t ErrorCode;
                         rd_kafka_topic_partition_t *rktpar;
 
                         rd_kafka_buf_read_i32(rkbuf, &partition);
@@ -763,76 +1052,71 @@ rd_kafka_handle_OffsetCommit (rd_kafka_t *rk,
                         }
 
                         rktpar->err = ErrorCode;
-			if (ErrorCode) {
-				last_ErrorCode = ErrorCode;
-				errcnt++;
-			}
+                        if (ErrorCode) {
+                                err = ErrorCode;
+                                errcnt++;
+
+                                /* Accumulate actions for per-partition
+                                 * errors. */
+                                actions |= rd_kafka_handle_OffsetCommit_error(
+                                        rkb, request, rktpar);
+                        }
+
+                        partcnt++;
                 }
         }
 
-	/* If all partitions failed use error code
-	 * from last partition as the global error. */
-	if (offsets && errcnt == offsets->cnt)
-		err = last_ErrorCode;
-	goto done;
+        /* If all partitions failed use error code
+         * from last partition as the global error. */
+        if (offsets && err && errcnt == partcnt)
+                goto err;
+
+        goto done;
 
  err_parse:
         err = rkbuf->rkbuf_err;
 
  err:
-        actions = rd_kafka_err_action(
-		rkb, err, rkbuf, request,
+        if (!actions) /* Transport/Request-level error */
+                actions = rd_kafka_err_action(
+                        rkb, err, request,
 
-		RD_KAFKA_ERR_ACTION_PERMANENT,
-		RD_KAFKA_RESP_ERR_OFFSET_METADATA_TOO_LARGE,
+                        RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_SPECIAL,
+                        RD_KAFKA_RESP_ERR__TRANSPORT,
 
-		RD_KAFKA_ERR_ACTION_RETRY,
-		RD_KAFKA_RESP_ERR_GROUP_LOAD_IN_PROGRESS,
+                        RD_KAFKA_ERR_ACTION_IGNORE,
+                        RD_KAFKA_RESP_ERR_ILLEGAL_GENERATION,
 
-		RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_SPECIAL,
-		RD_KAFKA_RESP_ERR_GROUP_COORDINATOR_NOT_AVAILABLE,
+                        RD_KAFKA_ERR_ACTION_IGNORE,
+                        RD_KAFKA_RESP_ERR_UNKNOWN_MEMBER_ID,
 
-		RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_SPECIAL,
-		RD_KAFKA_RESP_ERR_NOT_COORDINATOR_FOR_GROUP,
+                        RD_KAFKA_ERR_ACTION_END);
 
-		RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_RETRY,
-		RD_KAFKA_RESP_ERR_ILLEGAL_GENERATION,
+        if (actions & RD_KAFKA_ERR_ACTION_FATAL) {
+                rd_kafka_set_fatal_error(rk, err,
+                                         "OffsetCommit failed: %s",
+                                         rd_kafka_err2str(err));
+                return err;
+        }
 
-		RD_KAFKA_ERR_ACTION_REFRESH|RD_KAFKA_ERR_ACTION_RETRY,
-		RD_KAFKA_RESP_ERR_UNKNOWN_MEMBER_ID,
+        if (actions & RD_KAFKA_ERR_ACTION_REFRESH && rk->rk_cgrp) {
+                /* Mark coordinator dead or re-query for coordinator.
+                 * ..dead() will trigger a re-query. */
+                if (actions & RD_KAFKA_ERR_ACTION_SPECIAL)
+                        rd_kafka_cgrp_coord_dead(rk->rk_cgrp, err,
+                                                 "OffsetCommitRequest failed");
+                else
+                        rd_kafka_cgrp_coord_query(rk->rk_cgrp,
+                                                  "OffsetCommitRequest failed");
+        }
 
-		RD_KAFKA_ERR_ACTION_RETRY,
-		RD_KAFKA_RESP_ERR_REBALANCE_IN_PROGRESS,
-
-		RD_KAFKA_ERR_ACTION_PERMANENT,
-		RD_KAFKA_RESP_ERR_INVALID_COMMIT_OFFSET_SIZE,
-
-		RD_KAFKA_ERR_ACTION_PERMANENT,
-		RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
-
-		RD_KAFKA_ERR_ACTION_PERMANENT,
-		RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
-
-		RD_KAFKA_ERR_ACTION_END);
-
-	if (actions & RD_KAFKA_ERR_ACTION_REFRESH && rk->rk_cgrp) {
-		/* Mark coordinator dead or re-query for coordinator.
-		 * ..dead() will trigger a re-query. */
-		if (actions & RD_KAFKA_ERR_ACTION_SPECIAL)
-			rd_kafka_cgrp_coord_dead(rk->rk_cgrp, err,
-						 "OffsetCommitRequest failed");
-		else
-			rd_kafka_cgrp_coord_query(rk->rk_cgrp,
-						  "OffsetCommitRequest failed");
-	}
-	if (actions & RD_KAFKA_ERR_ACTION_RETRY) {
-		if (rd_kafka_buf_retry(rkb, request))
-			return RD_KAFKA_RESP_ERR__IN_PROGRESS;
-		/* FALLTHRU */
-	}
+        if (actions & RD_KAFKA_ERR_ACTION_RETRY &&
+            !(actions & RD_KAFKA_ERR_ACTION_PERMANENT) &&
+            rd_kafka_buf_retry(rkb, request))
+                return RD_KAFKA_RESP_ERR__IN_PROGRESS;
 
  done:
-	return err;
+        return err;
 }
 
 
@@ -846,7 +1130,6 @@ rd_kafka_handle_OffsetCommit (rd_kafka_t *rk,
  */
 int rd_kafka_OffsetCommitRequest (rd_kafka_broker_t *rkb,
                                    rd_kafka_cgrp_t *rkcg,
-                                   int16_t api_version,
                                    rd_kafka_topic_partition_list_t *offsets,
                                    rd_kafka_replyq_t replyq,
                                    rd_kafka_resp_cb_t *resp_cb,
@@ -859,6 +1142,13 @@ int rd_kafka_OffsetCommitRequest (rd_kafka_broker_t *rkb,
         int PartCnt = 0;
 	int tot_PartCnt = 0;
         int i;
+        int16_t ApiVersion;
+        int features;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(rkb,
+                                                          RD_KAFKAP_OffsetCommit,
+                                                          0, 7,
+                                                          &features);
 
         rd_kafka_assert(NULL, offsets != NULL);
 
@@ -869,15 +1159,20 @@ int rd_kafka_OffsetCommitRequest (rd_kafka_broker_t *rkb,
         rd_kafka_buf_write_kstr(rkbuf, rkcg->rkcg_group_id);
 
         /* v1,v2 */
-        if (api_version >= 1) {
+        if (ApiVersion >= 1) {
                 /* ConsumerGroupGenerationId */
                 rd_kafka_buf_write_i32(rkbuf, rkcg->rkcg_generation_id);
                 /* ConsumerId */
                 rd_kafka_buf_write_kstr(rkbuf, rkcg->rkcg_member_id);
-                /* v2: RetentionTime */
-                if (api_version == 2)
-                        rd_kafka_buf_write_i64(rkbuf, -1);
         }
+
+        /* v7: GroupInstanceId */
+        if (ApiVersion >= 7)
+            rd_kafka_buf_write_kstr(rkbuf, rkcg->rkcg_group_instance_id);
+
+        /* v2-4: RetentionTime */
+        if (ApiVersion >= 2 && ApiVersion <= 4)
+            rd_kafka_buf_write_i64(rkbuf, -1);
 
         /* Sort offsets by topic */
         rd_kafka_topic_partition_list_sort_by_topic(offsets);
@@ -917,9 +1212,13 @@ int rd_kafka_OffsetCommitRequest (rd_kafka_broker_t *rkb,
                 /* Offset */
                 rd_kafka_buf_write_i64(rkbuf, rktpar->offset);
 
+                /* v6: KIP-101 CommittedLeaderEpoch */
+                if (ApiVersion >= 6)
+                        rd_kafka_buf_write_i32(rkbuf, -1);
+
                 /* v1: TimeStamp */
-                if (api_version == 1)
-                        rd_kafka_buf_write_i64(rkbuf, -1);// FIXME: retention time
+                if (ApiVersion == 1)
+                        rd_kafka_buf_write_i64(rkbuf, -1);
 
                 /* Metadata */
 		/* Java client 0.9.0 and broker <0.10.0 can't parse
@@ -947,11 +1246,11 @@ int rd_kafka_OffsetCommitRequest (rd_kafka_broker_t *rkb,
         /* Finalize TopicCnt */
         rd_kafka_buf_update_u32(rkbuf, of_TopicCnt, TopicCnt);
 
-        rd_kafka_buf_ApiVersion_set(rkbuf, api_version, 0);
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
         rd_rkb_dbg(rkb, TOPIC, "OFFSET",
                    "Enqueue OffsetCommitRequest(v%d, %d/%d partition(s))): %s",
-                   api_version, tot_PartCnt, offsets->cnt, reason);
+                   ApiVersion, tot_PartCnt, offsets->cnt, reason);
 
 	rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
 
@@ -969,44 +1268,18 @@ static void rd_kafka_group_MemberState_consumer_write (
         rd_kafka_buf_t *env_rkbuf,
         const rd_kafka_group_member_t *rkgm) {
         rd_kafka_buf_t *rkbuf;
-        int i;
-        const char *last_topic = NULL;
-        size_t of_TopicCnt;
-        ssize_t of_PartCnt = -1;
-        int TopicCnt = 0;
-        int PartCnt = 0;
         rd_slice_t slice;
 
         rkbuf = rd_kafka_buf_new(1, 100);
         rd_kafka_buf_write_i16(rkbuf, 0); /* Version */
-        of_TopicCnt = rd_kafka_buf_write_i32(rkbuf, 0); /* Updated later */
-        for (i = 0 ; i < rkgm->rkgm_assignment->cnt ; i++) {
-                const rd_kafka_topic_partition_t *rktpar;
-
-                rktpar = &rkgm->rkgm_assignment->elems[i];
-
-                if (!last_topic || strcmp(last_topic,
-                                          rktpar->topic)) {
-                        if (last_topic)
-                                /* Finalize previous PartitionCnt */
-                                rd_kafka_buf_update_i32(rkbuf, of_PartCnt,
-                                                        PartCnt);
-                        rd_kafka_buf_write_str(rkbuf, rktpar->topic, -1);
-                        /* Updated later */
-                        of_PartCnt = rd_kafka_buf_write_i32(rkbuf, 0);
-                        PartCnt = 0;
-                        last_topic = rktpar->topic;
-                        TopicCnt++;
-                }
-
-                rd_kafka_buf_write_i32(rkbuf, rktpar->partition);
-                PartCnt++;
-        }
-
-        if (of_PartCnt != -1)
-                rd_kafka_buf_update_i32(rkbuf, of_PartCnt, PartCnt);
-        rd_kafka_buf_update_i32(rkbuf, of_TopicCnt, TopicCnt);
-
+        rd_assert(rkgm->rkgm_assignment);
+        rd_kafka_buf_write_topic_partitions(
+                rkbuf,
+                rkgm->rkgm_assignment,
+                rd_false /*don't skip invalid offsets*/,
+                rd_false /*don't write offsets*/,
+                rd_false /*don't write epoch*/,
+                rd_false /*don't write metadata*/);
         rd_kafka_buf_write_kbytes(rkbuf, rkgm->rkgm_userdata);
 
         /* Get pointer to binary buffer */
@@ -1026,6 +1299,7 @@ void rd_kafka_SyncGroupRequest (rd_kafka_broker_t *rkb,
                                 const rd_kafkap_str_t *group_id,
                                 int32_t generation_id,
                                 const rd_kafkap_str_t *member_id,
+                                const rd_kafkap_str_t *group_instance_id,
                                 const rd_kafka_group_member_t
                                 *assignments,
                                 int assignment_cnt,
@@ -1034,17 +1308,28 @@ void rd_kafka_SyncGroupRequest (rd_kafka_broker_t *rkb,
                                 void *opaque) {
         rd_kafka_buf_t *rkbuf;
         int i;
+        int16_t ApiVersion;
+        int features;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(rkb,
+                                                          RD_KAFKAP_SyncGroup,
+                                                          0, 3,
+                                                          &features);
 
         rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_SyncGroup,
                                          1,
                                          RD_KAFKAP_STR_SIZE(group_id) +
                                          4 /* GenerationId */ +
                                          RD_KAFKAP_STR_SIZE(member_id) +
+                                         RD_KAFKAP_STR_SIZE(
+                                                 group_instance_id) +
                                          4 /* array size group_assignment */ +
                                          (assignment_cnt * 100/*guess*/));
         rd_kafka_buf_write_kstr(rkbuf, group_id);
         rd_kafka_buf_write_i32(rkbuf, generation_id);
         rd_kafka_buf_write_kstr(rkbuf, member_id);
+        if (ApiVersion >= 3)
+                rd_kafka_buf_write_kstr(rkbuf, group_instance_id);
         rd_kafka_buf_write_i32(rkbuf, assignment_cnt);
 
         for (i = 0 ; i < assignment_cnt ; i++) {
@@ -1061,6 +1346,8 @@ void rd_kafka_SyncGroupRequest (rd_kafka_broker_t *rkb,
                 rkb->rkb_rk->rk_conf.group_session_timeout_ms +
                 3000/* 3s grace period*/,
                 0);
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
 }
@@ -1095,11 +1382,14 @@ void rd_kafka_handle_SyncGroup (rd_kafka_t *rk,
                 goto err;
         }
 
+        if (request->rkbuf_reqhdr.ApiVersion >= 1)
+                rd_kafka_buf_read_throttle_time(rkbuf);
+
         rd_kafka_buf_read_i16(rkbuf, &ErrorCode);
         rd_kafka_buf_read_bytes(rkbuf, &MemberState);
 
 err:
-        actions = rd_kafka_err_action(rkb, ErrorCode, rkbuf, request,
+        actions = rd_kafka_err_action(rkb, ErrorCode, request,
 				      RD_KAFKA_ERR_ACTION_END);
 
         if (actions & RD_KAFKA_ERR_ACTION_REFRESH) {
@@ -1140,6 +1430,7 @@ err:
 void rd_kafka_JoinGroupRequest (rd_kafka_broker_t *rkb,
                                 const rd_kafkap_str_t *group_id,
                                 const rd_kafkap_str_t *member_id,
+                                const rd_kafkap_str_t *group_instance_id,
                                 const rd_kafkap_str_t *protocol_type,
 				const rd_list_t *topics,
                                 rd_kafka_replyq_t replyq,
@@ -1154,7 +1445,7 @@ void rd_kafka_JoinGroupRequest (rd_kafka_broker_t *rkb,
 
         ApiVersion = rd_kafka_broker_ApiVersion_supported(rkb,
                                                           RD_KAFKAP_JoinGroup,
-                                                          0, 2,
+                                                          0, 5,
                                                           &features);
 
 
@@ -1164,6 +1455,8 @@ void rd_kafka_JoinGroupRequest (rd_kafka_broker_t *rkb,
                                          4 /* sessionTimeoutMs */ +
                                          4 /* rebalanceTimeoutMs */ +
                                          RD_KAFKAP_STR_SIZE(member_id) +
+                                         RD_KAFKAP_STR_SIZE(
+                                                 group_instance_id) +
                                          RD_KAFKAP_STR_SIZE(protocol_type) +
                                          4 /* array count GroupProtocols */ +
                                          (rd_list_cnt(topics) * 100));
@@ -1172,6 +1465,9 @@ void rd_kafka_JoinGroupRequest (rd_kafka_broker_t *rkb,
         if (ApiVersion >= 1)
                 rd_kafka_buf_write_i32(rkbuf, rk->rk_conf.max_poll_interval_ms);
         rd_kafka_buf_write_kstr(rkbuf, member_id);
+        if (ApiVersion >= 5)
+                rd_kafka_buf_write_kstr(rkbuf,
+                                        group_instance_id);
         rd_kafka_buf_write_kstr(rkbuf, protocol_type);
         rd_kafka_buf_write_i32(rkbuf, rk->rk_conf.enabled_assignor_cnt);
 
@@ -1180,7 +1476,9 @@ void rd_kafka_JoinGroupRequest (rd_kafka_broker_t *rkb,
 		if (!rkas->rkas_enabled)
 			continue;
                 rd_kafka_buf_write_kstr(rkbuf, rkas->rkas_protocol_name);
-                member_metadata = rkas->rkas_get_metadata_cb(rkas, topics);
+                member_metadata = rkas->rkas_get_metadata_cb(
+                        rkas, rk->rk_cgrp->rkcg_assignor_state, topics,
+                        rk->rk_cgrp->rkcg_group_assignment);
                 rd_kafka_buf_write_kbytes(rkbuf, member_metadata);
                 rd_kafkap_bytes_destroy(member_metadata);
         }
@@ -1203,6 +1501,20 @@ void rd_kafka_JoinGroupRequest (rd_kafka_broker_t *rkb,
                            "with this broker version",
                            rk->rk_conf.max_poll_interval_ms,
                            rk->rk_conf.group_session_timeout_ms);
+
+
+        if (ApiVersion < 5 &&
+            rk->rk_conf.group_instance_id &&
+            rd_interval(&rkb->rkb_suppress.unsupported_kip345,
+                        /* at most once per day */
+                        (rd_ts_t)86400 * 1000 * 1000, 0) > 0)
+                rd_rkb_log(rkb, LOG_NOTICE, "STATICMEMBER",
+                           "Broker does not support KIP-345 "
+                           "(requires Apache Kafka >= v2.3.0): "
+                           "consumer configuration "
+                           "`group.instance.id` (%s) "
+                           "will not take effect",
+                           rk->rk_conf.group_instance_id);
 
         /* Absolute timeout */
         rd_kafka_buf_set_abs_timeout_force(
@@ -1231,26 +1543,34 @@ void rd_kafka_JoinGroupRequest (rd_kafka_broker_t *rkb,
  * Send LeaveGroupRequest
  */
 void rd_kafka_LeaveGroupRequest (rd_kafka_broker_t *rkb,
-                                 const rd_kafkap_str_t *group_id,
-                                 const rd_kafkap_str_t *member_id,
+                                 const char *group_id,
+                                 const char *member_id,
                                  rd_kafka_replyq_t replyq,
                                  rd_kafka_resp_cb_t *resp_cb,
                                  void *opaque) {
         rd_kafka_buf_t *rkbuf;
+        int16_t ApiVersion = 0;
+        int features;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(rkb,
+                                                          RD_KAFKAP_LeaveGroup,
+                                                          0, 1,
+                                                          &features);
 
         rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_LeaveGroup,
-                                         1,
-                                         RD_KAFKAP_STR_SIZE(group_id) +
-                                         RD_KAFKAP_STR_SIZE(member_id));
-        rd_kafka_buf_write_kstr(rkbuf, group_id);
-        rd_kafka_buf_write_kstr(rkbuf, member_id);
+                                         1, 300);
+
+        rd_kafka_buf_write_str(rkbuf, group_id, -1);
+        rd_kafka_buf_write_str(rkbuf, member_id, -1);
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
         /* LeaveGroupRequests are best-effort, the local consumer
          * does not care if it succeeds or not, so the request timeout
          * is shortened.
          * Retries are not needed. */
         rd_kafka_buf_set_abs_timeout(rkbuf, 5000, 0);
-        rkbuf->rkbuf_retries = RD_KAFKA_BUF_NO_RETRIES;
+        rkbuf->rkbuf_max_retries = RD_KAFKA_BUF_NO_RETRIES;
 
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
 }
@@ -1279,7 +1599,7 @@ void rd_kafka_handle_LeaveGroup (rd_kafka_t *rk,
         rd_kafka_buf_read_i16(rkbuf, &ErrorCode);
 
 err:
-        actions = rd_kafka_err_action(rkb, ErrorCode, rkbuf, request,
+        actions = rd_kafka_err_action(rkb, ErrorCode, request,
 				      RD_KAFKA_ERR_ACTION_END);
 
         if (actions & RD_KAFKA_ERR_ACTION_REFRESH) {
@@ -1318,10 +1638,18 @@ void rd_kafka_HeartbeatRequest (rd_kafka_broker_t *rkb,
                                 const rd_kafkap_str_t *group_id,
                                 int32_t generation_id,
                                 const rd_kafkap_str_t *member_id,
+                                const rd_kafkap_str_t *group_instance_id,
                                 rd_kafka_replyq_t replyq,
                                 rd_kafka_resp_cb_t *resp_cb,
                                 void *opaque) {
         rd_kafka_buf_t *rkbuf;
+        int16_t ApiVersion = 0;
+        int features;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(rkb,
+                                                          RD_KAFKAP_Heartbeat,
+                                                          0, 3,
+                                                          &features);
 
         rd_rkb_dbg(rkb, CGRP, "HEARTBEAT",
                    "Heartbeat for group \"%s\" generation id %"PRId32,
@@ -1336,6 +1664,10 @@ void rd_kafka_HeartbeatRequest (rd_kafka_broker_t *rkb,
         rd_kafka_buf_write_kstr(rkbuf, group_id);
         rd_kafka_buf_write_i32(rkbuf, generation_id);
         rd_kafka_buf_write_kstr(rkbuf, member_id);
+        if (ApiVersion >= 3)
+                rd_kafka_buf_write_kstr(rkbuf, group_instance_id);
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
         rd_kafka_buf_set_abs_timeout(
                 rkbuf,
@@ -1447,7 +1779,7 @@ static void rd_kafka_handle_Metadata (rd_kafka_t *rk,
 
  err:
         actions = rd_kafka_err_action(
-                rkb, err, rkbuf, request,
+                rkb, err, request,
 
                 RD_KAFKA_ERR_ACTION_RETRY,
                 RD_KAFKA_RESP_ERR__PARTIAL,
@@ -1488,6 +1820,7 @@ static void rd_kafka_handle_Metadata (rd_kafka_t *rk,
  *  topics.cnt >0   - only specified topics are requested
  *
  * @param reason    - metadata request reason
+ * @param cgrp_update - Update cgrp in parse_Metadata (see comment there).
  * @param rko       - (optional) rko with replyq for handling response.
  *                    Specifying an rko forces a metadata request even if
  *                    there is already a matching one in-transit.
@@ -1501,6 +1834,7 @@ static void rd_kafka_handle_Metadata (rd_kafka_t *rk,
 rd_kafka_resp_err_t
 rd_kafka_MetadataRequest (rd_kafka_broker_t *rkb,
                           const rd_list_t *topics, const char *reason,
+                          rd_bool_t cgrp_update,
                           rd_kafka_op_t *rko) {
         rd_kafka_buf_t *rkbuf;
         int16_t ApiVersion = 0;
@@ -1510,16 +1844,17 @@ rd_kafka_MetadataRequest (rd_kafka_broker_t *rkb,
 
         ApiVersion = rd_kafka_broker_ApiVersion_supported(rkb,
                                                           RD_KAFKAP_Metadata,
-                                                          0, 2,
+                                                          0, 4,
                                                           &features);
 
         rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_Metadata, 1,
-                                         4 + (50 * topic_cnt));
+                                         4 + (50 * topic_cnt) + 1);
 
         if (!reason)
                 reason = "";
 
         rkbuf->rkbuf_u.Metadata.reason = rd_strdup(reason);
+        rkbuf->rkbuf_u.Metadata.cgrp_update = cgrp_update;
 
         if (!topics && ApiVersion >= 1) {
                 /* a null(0) array (in the protocol) represents no topics */
@@ -1592,6 +1927,29 @@ rd_kafka_MetadataRequest (rd_kafka_broker_t *rkb,
 
         }
 
+        if (ApiVersion >= 4) {
+                /* AllowAutoTopicCreation (only used by consumer) */
+                rd_kafka_buf_write_bool(
+                        rkbuf,
+                        rkb->rkb_rk->rk_type == RD_KAFKA_CONSUMER ?
+                        rkb->rkb_rk->rk_conf.allow_auto_create_topics :
+                        rd_true /*producer*/);
+        } else if (rkb->rkb_rk->rk_type == RD_KAFKA_CONSUMER &&
+                   !rkb->rkb_rk->rk_conf.allow_auto_create_topics &&
+                   rd_kafka_conf_is_modified(&rkb->rkb_rk->rk_conf,
+                                             "allow.auto.create.topics") &&
+                   rd_interval(&rkb->rkb_rk->rk_suppress.
+                               allow_auto_create_topics,
+                               30 * 60 * 1000 /* every 30 minutes */, 0) >= 0) {
+                /* Let user know we can't obey allow.auto.create.topics */
+                rd_rkb_log(rkb, LOG_WARNING, "AUTOCREATE",
+                           "allow.auto.create.topics=false not supported "
+                           "by broker: requires broker version >= 0.11.0.0: "
+                           "requested topic(s) may be auto created depending "
+                           "on broker auto.create.topics.enable configuration");
+        }
+
+
         rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
         /* Metadata requests are part of the important control plane
@@ -1621,10 +1979,12 @@ rd_kafka_MetadataRequest (rd_kafka_broker_t *rkb,
  * @brief Parses and handles ApiVersion reply.
  *
  * @param apis will be allocated, populated and sorted
- *             with broker's supported APIs.
+ *             with broker's supported APIs, or set to NULL.
  * @param api_cnt will be set to the number of elements in \p *apis
-
+ *
  * @returns 0 on success, else an error.
+ *
+ * @remark A valid \p apis might be returned even if an error is returned.
  */
 rd_kafka_resp_err_t
 rd_kafka_handle_ApiVersion (rd_kafka_t *rk,
@@ -1634,25 +1994,26 @@ rd_kafka_handle_ApiVersion (rd_kafka_t *rk,
 			    rd_kafka_buf_t *request,
 			    struct rd_kafka_ApiVersion **apis,
 			    size_t *api_cnt) {
-        const int log_decode_errors = LOG_ERR;
+        const int log_decode_errors = LOG_DEBUG;
 	int32_t ApiArrayCnt;
 	int16_t ErrorCode;
 	int i = 0;
 
 	*apis = NULL;
+        *api_cnt = 0;
 
         if (err)
                 goto err;
 
 	rd_kafka_buf_read_i16(rkbuf, &ErrorCode);
-	if ((err = ErrorCode))
-		goto err;
+        err = ErrorCode;
 
-        rd_kafka_buf_read_i32(rkbuf, &ApiArrayCnt);
-	if (ApiArrayCnt > 1000)
-		rd_kafka_buf_parse_fail(rkbuf,
-					"ApiArrayCnt %"PRId32" out of range",
-					ApiArrayCnt);
+        rd_kafka_buf_read_arraycnt(rkbuf, &ApiArrayCnt, 1000);
+        if (err && ApiArrayCnt < 1) {
+                /* Version >=3 returns the ApiVersions array if the error
+                 * code is ERR_UNSUPPORTED_VERSION, previous versions don't */
+                goto err;
+        }
 
 	rd_rkb_dbg(rkb, FEATURE, "APIVERSION",
 		   "Broker API support:");
@@ -1670,7 +2031,16 @@ rd_kafka_handle_ApiVersion (rd_kafka_t *rk,
 			   "  ApiKey %s (%hd) Versions %hd..%hd",
 			   rd_kafka_ApiKey2str(api->ApiKey),
 			   api->ApiKey, api->MinVer, api->MaxVer);
+
+                /* Discard struct tags */
+                rd_kafka_buf_skip_tags(rkbuf);
         }
+
+        if (request->rkbuf_reqhdr.ApiVersion >= 1)
+                rd_kafka_buf_read_throttle_time(rkbuf);
+
+        /* Discard end tags */
+        rd_kafka_buf_skip_tags(rkbuf);
 
 	*api_cnt = ApiArrayCnt;
         qsort(*apis, *api_cnt, sizeof(**apis), rd_kafka_ApiVersion_key_cmp);
@@ -1678,12 +2048,21 @@ rd_kafka_handle_ApiVersion (rd_kafka_t *rk,
 	goto done;
 
  err_parse:
-        err = rkbuf->rkbuf_err;
+        /* If the broker does not support our ApiVersionRequest version it
+         * will respond with a version 0 response, which will most likely
+         * fail parsing. Instead of propagating the parse error we
+         * propagate the original error, unless there isn't one in which case
+         * we use the parse error. */
+        if (!err)
+                err = rkbuf->rkbuf_err;
  err:
+        /* There are no retryable errors. */
+
 	if (*apis)
 		rd_free(*apis);
 
-        /* There are no retryable errors. */
+        *apis = NULL;
+        *api_cnt = 0;
 
  done:
         return err;
@@ -1692,25 +2071,55 @@ rd_kafka_handle_ApiVersion (rd_kafka_t *rk,
 
 
 /**
- * Send ApiVersionRequest (KIP-35)
+ * @brief Send ApiVersionRequest (KIP-35)
+ *
+ * @param ApiVersion If -1 use the highest supported version, else use the
+ *                   specified value.
  */
 void rd_kafka_ApiVersionRequest (rd_kafka_broker_t *rkb,
+                                 int16_t ApiVersion,
 				 rd_kafka_replyq_t replyq,
 				 rd_kafka_resp_cb_t *resp_cb,
 				 void *opaque) {
         rd_kafka_buf_t *rkbuf;
 
+        if (ApiVersion == -1)
+                ApiVersion = 3;
+
         rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_ApiVersion, 1, 4);
+
+        if (ApiVersion >= 3) {
+                /* KIP-511 adds software name and version through the optional
+                 * protocol fields defined in KIP-482.
+                 * As we don't yet support KIP-482 we handcraft the fields here
+                 * and mark the buffer as flexible-version for special
+                 * treatment in buf_finalize, et.al. */
+
+                /* No request header tags */
+                rd_kafka_buf_write_i8(rkbuf, 0);
+
+                rkbuf->rkbuf_flags |= RD_KAFKA_OP_F_FLEXVER;
+
+                /* ClientSoftwareName */
+                rd_kafka_buf_write_compact_str(rkbuf,
+                                               rkb->rkb_rk->rk_conf.sw_name, -1);
+
+                /* ClientSoftwareVersion */
+                rd_kafka_buf_write_compact_str(rkbuf,
+                                               rkb->rkb_rk->rk_conf.sw_version,
+                                               -1);
+
+                /* No struct tags */
+                rd_kafka_buf_write_i8(rkbuf, 0);
+        }
 
         /* Should be sent before any other requests since it is part of
          * the initial connection handshake. */
         rkbuf->rkbuf_prio = RD_KAFKA_PRIO_FLASH;
 
-	rd_kafka_buf_write_i32(rkbuf, 0); /* Empty array: request all APIs */
-
-	/* Non-supporting brokers will tear down the connection when they
-	 * receive an unknown API request, so dont retry request on failure. */
-	rkbuf->rkbuf_retries = RD_KAFKA_BUF_NO_RETRIES;
+        /* Non-supporting brokers will tear down the connection when they
+         * receive an unknown API request, so dont retry request on failure. */
+        rkbuf->rkbuf_max_retries = RD_KAFKA_BUF_NO_RETRIES;
 
 	/* 0.9.0.x brokers will not close the connection on unsupported
 	 * API requests, so we minimize the timeout for the request.
@@ -1719,6 +2128,8 @@ void rd_kafka_ApiVersionRequest (rd_kafka_broker_t *rkb,
                 rkbuf,
                 rkb->rkb_rk->rk_conf.api_version_request_timeout_ms,
                 0);
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
         if (replyq.q)
                 rd_kafka_broker_buf_enq_replyq(rkb,
@@ -1738,6 +2149,8 @@ void rd_kafka_SaslHandshakeRequest (rd_kafka_broker_t *rkb,
 				    void *opaque) {
         rd_kafka_buf_t *rkbuf;
 	int mechlen = (int)strlen(mechanism);
+        int16_t ApiVersion;
+        int features;
 
         rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_SaslHandshake,
                                          1, RD_KAFKAP_STR_SIZE0(mechlen));
@@ -1748,10 +2161,10 @@ void rd_kafka_SaslHandshakeRequest (rd_kafka_broker_t *rkb,
 
 	rd_kafka_buf_write_str(rkbuf, mechanism, mechlen);
 
-	/* Non-supporting brokers will tear down the conneciton when they
-	 * receive an unknown API request or where the SASL GSSAPI
-	 * token type is not recognized, so dont retry request on failure. */
-	rkbuf->rkbuf_retries = RD_KAFKA_BUF_NO_RETRIES;
+        /* Non-supporting brokers will tear down the conneciton when they
+         * receive an unknown API request or where the SASL GSSAPI
+         * token type is not recognized, so dont retry request on failure. */
+        rkbuf->rkbuf_max_retries = RD_KAFKA_BUF_NO_RETRIES;
 
 	/* 0.9.0.x brokers will not close the connection on unsupported
 	 * API requests, so we minimize the timeout of the request.
@@ -1759,6 +2172,13 @@ void rd_kafka_SaslHandshakeRequest (rd_kafka_broker_t *rkb,
         if (!rkb->rkb_rk->rk_conf.api_version_request &&
             rkb->rkb_rk->rk_conf.socket_timeout_ms > 10*1000)
                 rd_kafka_buf_set_abs_timeout(rkbuf, 10*1000 /*10s*/, 0);
+
+        /* ApiVersion 1 / RD_KAFKA_FEATURE_SASL_REQ enables
+         * the SaslAuthenticateRequest */
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                rkb, RD_KAFKAP_SaslHandshake, 0, 1, &features);
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
 	if (replyq.q)
 		rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq,
@@ -1768,7 +2188,117 @@ void rd_kafka_SaslHandshakeRequest (rd_kafka_broker_t *rkb,
 }
 
 
+/**
+ * @brief Parses and handles an SaslAuthenticate reply.
+ *
+ * @returns 0 on success, else an error.
+ *
+ * @locality broker thread
+ * @locks none
+ */
+void
+rd_kafka_handle_SaslAuthenticate (rd_kafka_t *rk,
+                                  rd_kafka_broker_t *rkb,
+                                  rd_kafka_resp_err_t err,
+                                  rd_kafka_buf_t *rkbuf,
+                                  rd_kafka_buf_t *request,
+                                  void *opaque) {
+        const int log_decode_errors = LOG_ERR;
+        int16_t error_code;
+        rd_kafkap_str_t error_str;
+        rd_kafkap_bytes_t auth_data;
+        char errstr[512];
 
+        if (err) {
+                rd_snprintf(errstr, sizeof(errstr),
+                            "SaslAuthenticateRequest failed: %s",
+                            rd_kafka_err2str(err));
+                goto err;
+        }
+
+        rd_kafka_buf_read_i16(rkbuf, &error_code);
+        rd_kafka_buf_read_str(rkbuf, &error_str);
+
+        if (error_code) {
+                /* Authentication failed */
+
+                /* For backwards compatibility translate the
+                 * new broker-side auth error code to our local error code. */
+                if (error_code == RD_KAFKA_RESP_ERR_SASL_AUTHENTICATION_FAILED)
+                        err = RD_KAFKA_RESP_ERR__AUTHENTICATION;
+                else
+                        err = error_code;
+
+                rd_snprintf(errstr, sizeof(errstr), "%.*s",
+                            RD_KAFKAP_STR_PR(&error_str));
+                goto err;
+        }
+
+        rd_kafka_buf_read_bytes(rkbuf, &auth_data);
+
+        /* Pass SASL auth frame to SASL handler */
+        if (rd_kafka_sasl_recv(rkb->rkb_transport,
+                               auth_data.data,
+                               (size_t)RD_KAFKAP_BYTES_LEN(&auth_data),
+                               errstr, sizeof(errstr)) == -1) {
+                err = RD_KAFKA_RESP_ERR__AUTHENTICATION;
+                goto err;
+        }
+
+        return;
+
+
+ err_parse:
+        err = rkbuf->rkbuf_err;
+        rd_snprintf(errstr, sizeof(errstr),
+                    "SaslAuthenticateResponse parsing failed: %s",
+                    rd_kafka_err2str(err));
+
+ err:
+        rd_kafka_broker_fail(rkb, LOG_ERR, err,
+                             "SASL authentication error: %s", errstr);
+}
+
+
+/**
+ * @brief Send SaslAuthenticateRequest (KIP-152)
+ */
+void rd_kafka_SaslAuthenticateRequest (rd_kafka_broker_t *rkb,
+                                       const void *buf, size_t size,
+                                       rd_kafka_replyq_t replyq,
+                                       rd_kafka_resp_cb_t *resp_cb,
+                                       void *opaque) {
+        rd_kafka_buf_t *rkbuf;
+
+        rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_SaslAuthenticate, 0, 0);
+
+        /* Should be sent before any other requests since it is part of
+         * the initial connection handshake. */
+        rkbuf->rkbuf_prio = RD_KAFKA_PRIO_FLASH;
+
+        /* Broker does not support -1 (Null) for this field */
+        rd_kafka_buf_write_bytes(rkbuf, buf ? buf : "", size);
+
+        /* There are no errors that can be retried, instead
+         * close down the connection and reconnect on failure. */
+        rkbuf->rkbuf_max_retries = RD_KAFKA_BUF_NO_RETRIES;
+
+        if (replyq.q)
+                rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq,
+                                               resp_cb, opaque);
+        else /* in broker thread */
+                rd_kafka_broker_buf_enq1(rkb, rkbuf, resp_cb, opaque);
+}
+
+
+
+/**
+ * @struct Hold temporary result and return values from ProduceResponse
+ */
+struct rd_kafka_Produce_result {
+        int64_t offset;    /**< Assigned offset of first message */
+        int64_t timestamp; /**< (Possibly assigned) offset of first message */
+};
 
 /**
  * @brief Parses a Produce reply.
@@ -1780,8 +2310,7 @@ rd_kafka_handle_Produce_parse (rd_kafka_broker_t *rkb,
                                rd_kafka_toppar_t *rktp,
                                rd_kafka_buf_t *rkbuf,
                                rd_kafka_buf_t *request,
-                               int64_t *offsetp,
-                               int64_t *timestampp) {
+                               struct rd_kafka_Produce_result *result) {
         int32_t TopicArrayCnt;
         int32_t PartitionArrayCnt;
         struct {
@@ -1810,11 +2339,11 @@ rd_kafka_handle_Produce_parse (rd_kafka_broker_t *rkb,
         rd_kafka_buf_read_i16(rkbuf, &hdr.ErrorCode);
         rd_kafka_buf_read_i64(rkbuf, &hdr.Offset);
 
-        *offsetp = hdr.Offset;
+        result->offset = hdr.Offset;
 
-        *timestampp = -1;
+        result->timestamp = -1;
         if (request->rkbuf_reqhdr.ApiVersion >= 2)
-                rd_kafka_buf_read_i64(rkbuf, timestampp);
+                rd_kafka_buf_read_i64(rkbuf, &result->timestamp);
 
         if (request->rkbuf_reqhdr.ApiVersion >= 5)
                 rd_kafka_buf_read_i64(rkbuf, &log_start_offset);
@@ -1844,7 +2373,7 @@ struct rd_kafka_Produce_err {
         rd_kafka_resp_err_t err;  /**< Error code */
         int actions;              /**< Actions to take */
         int incr_retry;           /**< Increase per-message retry cnt */
-        rd_kafka_msg_status_t status; /**< Messages persistance status */
+        rd_kafka_msg_status_t status; /**< Messages persistence status */
 
         /* Idempotent Producer */
         int32_t next_ack_seq;      /**< Next expected sequence to ack */
@@ -1870,10 +2399,10 @@ struct rd_kafka_Produce_err {
  */
 static void
 rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
-                                          rd_kafka_toppar_t *rktp,
-                                          rd_kafka_buf_t *request,
+                                          rd_kafka_msgbatch_t *batch,
                                           struct rd_kafka_Produce_err *perr) {
         rd_kafka_t *rk = rkb->rkb_rk;
+        rd_kafka_toppar_t *rktp = batch->rktp;
         rd_kafka_msg_t *firstmsg, *lastmsg;
         int r;
         rd_ts_t now = rd_clock(), state_age;
@@ -1883,8 +2412,8 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
         state_age = now - rkb->rkb_rk->rk_eos.ts_idemp_state;
         rd_kafka_rdunlock(rkb->rkb_rk);
 
-        firstmsg = rd_kafka_msgq_first(&request->rkbuf_msgq);
-        lastmsg = rd_kafka_msgq_last(&request->rkbuf_msgq);
+        firstmsg = rd_kafka_msgq_first(&batch->msgq);
+        lastmsg = rd_kafka_msgq_last(&batch->msgq);
         rd_assert(firstmsg && lastmsg);
 
         /* Store the last msgid of the batch
@@ -1900,7 +2429,7 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                         lastmsg->rkm_u.producer.msgid;
         }
 
-        if (!rd_kafka_pid_eq(request->rkbuf_u.Produce.pid, perr->rktp_pid)) {
+        if (!rd_kafka_pid_eq(batch->pid, perr->rktp_pid)) {
                 /* Don't retry if PID changed since we can't
                  * guarantee correctness across PID sessions. */
                 perr->actions = RD_KAFKA_ERR_ACTION_PERMANENT;
@@ -1912,8 +2441,7 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                            "failing messages with error %s",
                            RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                            rktp->rktp_partition,
-                           rd_kafka_pid2str(request->rkbuf_u.
-                                            Produce.pid),
+                           rd_kafka_pid2str(batch->pid),
                            rd_kafka_pid2str(perr->rktp_pid),
                            rd_kafka_err2str(perr->err));
                 return;
@@ -1938,7 +2466,7 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                 last_err = rktp->rktp_last_err;
                 rd_kafka_toppar_unlock(rktp);
 
-                r = request->rkbuf_u.Produce.base_seq - perr->next_err_seq;
+                r = batch->first_seq - perr->next_ack_seq;
 
                 if (r == 0) {
                         /* R1 failed:
@@ -1951,7 +2479,7 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                          * nor give the user a chance to opt out of sending
                          * R2 to R4 which would be retried automatically. */
 
-                        rd_kafka_set_fatal_error(
+                        rd_kafka_idemp_set_fatal_error(
                                 rk, perr->err,
                                 "ProduceRequest for %.*s [%"PRId32"] "
                                 "with %d message(s) failed "
@@ -1963,10 +2491,10 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                                 ", base msgid %"PRIu64", %"PRId64"ms ago)",
                                 RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                                 rktp->rktp_partition,
-                                rd_kafka_msgq_len(&request->rkbuf_msgq),
+                                rd_kafka_msgq_len(&batch->msgq),
                                 rkb->rkb_nodeid,
-                                rd_kafka_pid2str(request->rkbuf_u.Produce.pid),
-                                request->rkbuf_u.Produce.base_seq,
+                                rd_kafka_pid2str(batch->pid),
+                                batch->first_seq,
                                 state_age / 1000,
                                 rd_kafka_err2name(last_err.err),
                                 rd_kafka_actions2str(last_err.actions),
@@ -2005,11 +2533,10 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                                    "recovering and retrying",
                                    RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                                    rktp->rktp_partition,
-                                   rd_kafka_msgq_len(&request->rkbuf_msgq),
-                                   rd_kafka_pid2str(request->rkbuf_u.
-                                                    Produce.pid),
-                                   request->rkbuf_u.Produce.base_seq,
-                                   perr->next_err_seq,
+                                   rd_kafka_msgq_len(&batch->msgq),
+                                   rd_kafka_pid2str(batch->pid),
+                                   batch->first_seq,
+                                   perr->next_ack_seq,
                                    rd_kafka_err2name(last_err.err),
                                    rd_kafka_actions2str(last_err.actions),
                                    last_err.base_seq, last_err.last_seq,
@@ -2023,14 +2550,15 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                         perr->update_next_ack = rd_false;
                         perr->update_next_err = rd_true;
 
-                        rd_kafka_idemp_drain_epoch_bump(rk);
+                        rd_kafka_idemp_drain_epoch_bump(
+                                rk, "skipped sequence numbers");
 
                 } else {
                         /* Request's sequence is less than next ack,
                          * this should never happen unless we have
                          * local bug or the broker did not respond
                          * to the requests in order. */
-                        rd_kafka_set_fatal_error(
+                        rd_kafka_idemp_set_fatal_error(
                                 rk, perr->err,
                                 "ProduceRequest for %.*s [%"PRId32"] "
                                 "with %d message(s) failed "
@@ -2042,11 +2570,11 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                                 ", base msgid %"PRIu64", %"PRId64"ms ago)",
                                 RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                                 rktp->rktp_partition,
-                                rd_kafka_msgq_len(&request->rkbuf_msgq),
+                                rd_kafka_msgq_len(&batch->msgq),
                                 rkb->rkb_nodeid,
-                                rd_kafka_pid2str(request->rkbuf_u.Produce.pid),
-                                request->rkbuf_u.Produce.base_seq,
-                                perr->next_err_seq,
+                                rd_kafka_pid2str(batch->pid),
+                                batch->first_seq,
+                                perr->next_ack_seq,
                                 rd_kafka_err2name(last_err.err),
                                 rd_kafka_actions2str(last_err.actions),
                                 last_err.base_seq, last_err.last_seq,
@@ -2081,10 +2609,9 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                            "marking the messages successfully delivered",
                            RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                            rktp->rktp_partition,
-                           rd_kafka_msgq_len(&request->rkbuf_msgq),
-                           rd_kafka_pid2str(request->rkbuf_u.
-                                            Produce.pid),
-                           request->rkbuf_u.Produce.base_seq);
+                           rd_kafka_msgq_len(&batch->msgq),
+                           rd_kafka_pid2str(batch->pid),
+                           batch->first_seq);
 
                 /* Void error, delivery succeeded */
                 perr->err = RD_KAFKA_RESP_ERR_NO_ERROR;
@@ -2106,10 +2633,61 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                  * If there are outstanding messages not yet acknowledged
                  * then there is no safe way to carry on without risking
                  * duplication or reordering, in which case we fail
-                 * the producer. */
+                 * the producer.
+                 *
+                 * With KIP-360 the UNKNOWN_PRODUCER_ID is always retryable
+                 * (after acquiring a new PID) when using the transactional
+                 * producer.
+                 */
+                /* FIXME: KIP-360 might not be finalized, wait out with this */
+#ifdef RD_KAFKA_FEATURE_KIP360
+                if (rd_kafka_is_transactional(rk) &&
+                    rd_kafka_broker_supports(rkb, RD_KAFKA_FEATURE_KIP360)) {
+                        rd_rkb_dbg(rkb, MSG|RD_KAFKA_DBG_EOS, "UNKPID",
+                                   "ProduceRequest for %.*s [%"PRId32"] "
+                                   "with %d message(s) failed "
+                                   "due to unknown producer id "
+                                   "(%s, base seq %"PRId32", %d retries): "
+                                   "failing the current transaction",
+                                   RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
+                                   rktp->rktp_partition,
+                                   rd_kafka_msgq_len(&batch->msgq),
+                                   rd_kafka_pid2str(batch->pid),
+                                   batch->first_seq,
+                                   firstmsg->rkm_u.producer.retries);
 
-                if (!firstmsg->rkm_u.producer.retries &&
-                    perr->next_err_seq == request->rkbuf_u.Produce.base_seq) {
+                        rd_kafka_txn_set_abortable_error(
+                                rk,
+                                RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID,
+                                "ProduceRequest for %.*s [%"PRId32"] "
+                                "with %d message(s) failed "
+                                "due to unknown producer id",
+                                RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
+                                rktp->rktp_partition,
+                                rd_kafka_msgq_len(&batch->msgq));
+
+                        /* Drain outstanding requests and re-request PID */
+                        rd_kafka_idemp_drain_reset(rk, "unknown producer id");
+
+                        /* FIXME: user must call abort_transaction()
+                         *        and then wait for new pid.
+                         *        How do we transition from ABORTABLE_ERROR
+                         *        to WAIT_PID?
+                         *        Maybe pass refresh_pid to set_abortable_err?
+                         */
+
+                        perr->incr_retry = 0;
+                        perr->actions = RD_KAFKA_ERR_ACTION_RETRY;
+                        perr->status  = RD_KAFKA_MSG_STATUS_POSSIBLY_PERSISTED;
+                        perr->update_next_ack = rd_false;
+                        perr->update_next_err = rd_true;
+                        break;
+
+                } else
+#endif
+
+                        if (!firstmsg->rkm_u.producer.retries &&
+                           perr->next_err_seq == batch->first_seq) {
                         rd_rkb_dbg(rkb, MSG|RD_KAFKA_DBG_EOS, "UNKPID",
                                    "ProduceRequest for %.*s [%"PRId32"] "
                                    "with %d message(s) failed "
@@ -2119,14 +2697,14 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                                    "resetting PID and retrying",
                                    RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                                    rktp->rktp_partition,
-                                   rd_kafka_msgq_len(&request->rkbuf_msgq),
-                                   rd_kafka_pid2str(request->rkbuf_u.
-                                                    Produce.pid),
-                                   request->rkbuf_u.Produce.base_seq,
+                                   rd_kafka_msgq_len(&batch->msgq),
+                                   rd_kafka_pid2str(batch->pid),
+                                   batch->first_seq,
                                    firstmsg->rkm_u.producer.retries);
 
                         /* Drain outstanding requests and bump epoch. */
-                        rd_kafka_idemp_drain_epoch_bump(rk);
+                        rd_kafka_idemp_drain_epoch_bump(rk,
+                                                        "unknown producer id");
 
                         perr->incr_retry = 0;
                         perr->actions = RD_KAFKA_ERR_ACTION_RETRY;
@@ -2136,7 +2714,7 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                         break;
                 }
 
-                rd_kafka_set_fatal_error(
+                rd_kafka_idemp_set_fatal_error(
                         rk, perr->err,
                         "ProduceRequest for %.*s [%"PRId32"] "
                         "with %d message(s) failed "
@@ -2146,10 +2724,10 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
                         "duplication/reordering",
                         RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                         rktp->rktp_partition,
-                        rd_kafka_msgq_len(&request->rkbuf_msgq),
+                        rd_kafka_msgq_len(&batch->msgq),
                         rkb->rkb_nodeid,
-                        rd_kafka_pid2str(request->rkbuf_u.Produce.pid),
-                        request->rkbuf_u.Produce.base_seq,
+                        rd_kafka_pid2str(batch->pid),
+                        batch->first_seq,
                         firstmsg->rkm_u.producer.retries);
 
                 perr->actions = RD_KAFKA_ERR_ACTION_PERMANENT;
@@ -2179,15 +2757,17 @@ rd_kafka_handle_idempotent_Produce_error (rd_kafka_broker_t *rkb,
  *
  * @warning May be called on the old leader thread. Lock rktp appropriately!
  *
+ * @warning \p request may be NULL.
+ *
  * @locality broker thread (but not necessarily the leader broker)
  * @locks none
  */
 static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
-                                          rd_kafka_toppar_t *rktp,
-                                          rd_kafka_buf_t *reply,
-                                          rd_kafka_buf_t *request,
+                                          const rd_kafka_buf_t *request,
+                                          rd_kafka_msgbatch_t *batch,
                                           struct rd_kafka_Produce_err *perr) {
         rd_kafka_t *rk = rkb->rkb_rk;
+        rd_kafka_toppar_t *rktp = batch->rktp;
         int is_leader;
 
         if (unlikely(perr->err == RD_KAFKA_RESP_ERR__DESTROY))
@@ -2200,7 +2780,7 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
          * check once if we're the leader (which allows relaxed
          * locking), and cache the current rktp's eos state vars. */
         rd_kafka_toppar_lock(rktp);
-        is_leader = rktp->rktp_leader == rkb;
+        is_leader = rktp->rktp_broker == rkb;
         perr->rktp_pid = rktp->rktp_eos.pid;
         perr->next_ack_seq = rktp->rktp_eos.next_ack_seq;
         perr->next_err_seq = rktp->rktp_eos.next_err_seq;
@@ -2215,7 +2795,7 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
          * all other errors are considered permanent failures.
          * (also see rd_kafka_err_action() for the default actions). */
         perr->actions = rd_kafka_err_action(
-                rkb, perr->err, reply, request,
+                rkb, perr->err, request,
 
                 RD_KAFKA_ERR_ACTION_REFRESH|
                 RD_KAFKA_ERR_ACTION_MSG_POSSIBLY_PERSISTED,
@@ -2224,6 +2804,15 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                 RD_KAFKA_ERR_ACTION_REFRESH|
                 RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED,
                 RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART,
+
+                RD_KAFKA_ERR_ACTION_PERMANENT|
+                RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED,
+                RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+
+                RD_KAFKA_ERR_ACTION_REFRESH|
+                RD_KAFKA_ERR_ACTION_RETRY|
+                RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED,
+                RD_KAFKA_RESP_ERR_KAFKA_STORAGE_ERROR,
 
                 RD_KAFKA_ERR_ACTION_RETRY|
                 RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED,
@@ -2260,6 +2849,10 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                 RD_KAFKA_ERR_ACTION_MSG_POSSIBLY_PERSISTED,
                 RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID,
 
+                RD_KAFKA_ERR_ACTION_PERMANENT|
+                RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED,
+                RD_KAFKA_RESP_ERR_INVALID_PRODUCER_EPOCH,
+
                 /* Message was purged from out-queue due to
                  * Idempotent Producer Id change */
                 RD_KAFKA_ERR_ACTION_RETRY,
@@ -2272,9 +2865,8 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                    "(MsgId %"PRIu64", BaseSeq %"PRId32") "
                    "encountered error: %s (actions %s)%s",
                    rktp->rktp_rkt->rkt_topic->str, rktp->rktp_partition,
-                   request->rkbuf_msgq.rkmq_msg_cnt,
-                   request->rkbuf_u.Produce.base_msgid,
-                   request->rkbuf_u.Produce.base_seq,
+                   rd_kafka_msgq_len(&batch->msgq),
+                   batch->first_msgid, batch->first_seq,
                    rd_kafka_err2str(perr->err),
                    rd_kafka_actions2str(perr->actions),
                    is_leader ? "" : " [NOT LEADER]");
@@ -2288,11 +2880,9 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
          *       directly to the application.
          */
         if (rd_kafka_is_idempotent(rk))
-                rd_kafka_handle_idempotent_Produce_error(rkb, rktp, request,
-                                                         perr);
+                rd_kafka_handle_idempotent_Produce_error(rkb, batch, perr);
 
-
-        /* Update message persistance status based on action flags.
+        /* Update message persistence status based on action flags.
          * None of these are typically set after an idempotent error,
          * which sets the status explicitly. */
         if (perr->actions & RD_KAFKA_ERR_ACTION_MSG_POSSIBLY_PERSISTED)
@@ -2308,17 +2898,17 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
         rktp->rktp_last_err.err = perr->err;
         rktp->rktp_last_err.actions = perr->actions;
         rktp->rktp_last_err.ts = rd_clock();
-        rktp->rktp_last_err.base_seq = request->rkbuf_u.Produce.base_seq;
+        rktp->rktp_last_err.base_seq = batch->first_seq;
         rktp->rktp_last_err.last_seq = perr->last_seq;
-        rktp->rktp_last_err.base_msgid = request->rkbuf_u.Produce.base_msgid;
+        rktp->rktp_last_err.base_msgid = batch->first_msgid;
         rd_kafka_toppar_unlock(rktp);
 
         /*
          * Handle actions
          */
         if (perr->actions & (RD_KAFKA_ERR_ACTION_REFRESH |
-                            RD_KAFKA_ERR_ACTION_RETRY)) {
-                /* Retry */
+                             RD_KAFKA_ERR_ACTION_RETRY)) {
+                /* Retry (refresh also implies retry) */
 
                 if (perr->actions & RD_KAFKA_ERR_ACTION_REFRESH) {
                         /* Request metadata information update.
@@ -2336,8 +2926,12 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                         /* We can't be certain the request wasn't
                          * sent in case of transport failure,
                          * so the ERR__TRANSPORT case will need
-                         * the retry count to be increased */
-                        if (perr->err != RD_KAFKA_RESP_ERR__TRANSPORT)
+                         * the retry count to be increased,
+                         * In case of certain other errors we want to
+                         * avoid retrying for the duration of the
+                         * message.timeout.ms to speed up error propagation. */
+                        if (perr->err != RD_KAFKA_RESP_ERR__TRANSPORT &&
+                            perr->err != RD_KAFKA_RESP_ERR_KAFKA_STORAGE_ERROR)
                                 perr->incr_retry = 0;
                 }
 
@@ -2378,7 +2972,8 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                          * are attempted with proper state knowledge and
                          * without any in-flight requests. */
                         rd_kafka_toppar_lock(rktp);
-                        rd_kafka_idemp_drain_toppar(rktp);
+                        rd_kafka_idemp_drain_toppar(rktp,
+                                                    "drain before retrying");
                         rd_kafka_toppar_unlock(rktp);
                 }
 
@@ -2390,11 +2985,11 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                  * for each message is honoured, any messages that
                  * would exceeded the retry count will not be
                  * moved but instead fail below. */
-                rd_kafka_toppar_retry_msgq(rktp, &request->rkbuf_msgq,
+                rd_kafka_toppar_retry_msgq(rktp, &batch->msgq,
                                            perr->incr_retry,
                                            perr->status);
 
-                if (rd_kafka_msgq_len(&request->rkbuf_msgq) == 0) {
+                if (rd_kafka_msgq_len(&batch->msgq) == 0) {
                         /* No need do anything more with the request
                          * here since the request no longer has any
                          * messages associated with it. */
@@ -2404,13 +2999,56 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
 
         if (perr->actions & RD_KAFKA_ERR_ACTION_PERMANENT &&
             rd_kafka_is_idempotent(rk)) {
-                if (rk->rk_conf.eos.gapless) {
+                if (rd_kafka_is_transactional(rk) &&
+                    perr->err == RD_KAFKA_RESP_ERR_INVALID_PRODUCER_EPOCH) {
+                        /* Producer was fenced by new transactional producer
+                         * with the same transactional.id */
+                        rd_kafka_txn_set_fatal_error(
+                                rk, RD_DO_LOCK,
+                                RD_KAFKA_RESP_ERR__FENCED,
+                                "ProduceRequest for %.*s [%"PRId32"] "
+                                "with %d message(s) failed: %s "
+                                "(broker %"PRId32" %s, base seq %"PRId32"): "
+                                "transactional producer fenced by newer "
+                                "producer instance",
+                                RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
+                                rktp->rktp_partition,
+                                rd_kafka_msgq_len(&batch->msgq),
+                                rd_kafka_err2str(perr->err),
+                                rkb->rkb_nodeid,
+                                rd_kafka_pid2str(batch->pid),
+                                batch->first_seq);
+
+                        /* Drain outstanding requests and reset PID. */
+                        rd_kafka_idemp_drain_reset(
+                                rk, "fenced by new transactional producer");
+
+                } else if (rd_kafka_is_transactional(rk)) {
+                        /* When transactional any permanent produce failure
+                         * would lead to an incomplete transaction, so raise
+                         * an abortable transaction error. */
+                        rd_kafka_txn_set_abortable_error(
+                                rk,
+                                perr->err,
+                                "ProduceRequest for %.*s [%"PRId32"] "
+                                "with %d message(s) failed: %s "
+                                "(broker %"PRId32" %s, base seq %"PRId32"): "
+                                "current transaction must be aborted",
+                                RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
+                                rktp->rktp_partition,
+                                rd_kafka_msgq_len(&batch->msgq),
+                                rd_kafka_err2str(perr->err),
+                                rkb->rkb_nodeid,
+                                rd_kafka_pid2str(batch->pid),
+                                batch->first_seq);
+
+                } else if (rk->rk_conf.eos.gapless) {
                         /* A permanent non-idempotent error will lead to
                          * gaps in the message series, the next request
                          * will fail with ...ERR_OUT_OF_ORDER_SEQUENCE_NUMBER.
                          * To satisfy the gapless guarantee we need to raise
                          * a fatal error here. */
-                        rd_kafka_set_fatal_error(
+                        rd_kafka_idemp_set_fatal_error(
                                 rk, RD_KAFKA_RESP_ERR__GAPLESS_GUARANTEE,
                                 "ProduceRequest for %.*s [%"PRId32"] "
                                 "with %d message(s) failed: "
@@ -2418,21 +3056,23 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                                 "unable to satisfy gap-less guarantee",
                                 RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                                 rktp->rktp_partition,
-                                rd_kafka_msgq_len(&request->rkbuf_msgq),
+                                rd_kafka_msgq_len(&batch->msgq),
                                 rd_kafka_err2str(perr->err),
                                 rkb->rkb_nodeid,
-                                rd_kafka_pid2str(request->rkbuf_u.Produce.pid),
-                                request->rkbuf_u.Produce.base_seq);
+                                rd_kafka_pid2str(batch->pid),
+                                batch->first_seq);
 
                         /* Drain outstanding requests and reset PID. */
-                        rd_kafka_idemp_drain_reset(rk);
+                        rd_kafka_idemp_drain_reset(
+                                rk, "unable to satisfy gap-less guarantee");
 
                 } else {
                         /* If gapless is not set we bump the Epoch and
                          * renumber the messages to send. */
 
                         /* Drain outstanding requests and bump the epoch .*/
-                        rd_kafka_idemp_drain_epoch_bump(rk);
+                        rd_kafka_idemp_drain_epoch_bump(
+                                rk, "message sequence gap");
                 }
 
                 perr->update_next_ack = rd_false;
@@ -2440,11 +3080,19 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                 perr->update_next_err = rd_true;
         }
 
-        /* Translate request-level timeout error code
-         * to message-level timeout error code. */
         if (perr->err == RD_KAFKA_RESP_ERR__TIMED_OUT ||
-            perr->err == RD_KAFKA_RESP_ERR__TIMED_OUT_QUEUE)
+            perr->err == RD_KAFKA_RESP_ERR__TIMED_OUT_QUEUE) {
+                /* Translate request-level timeout error code
+                 * to message-level timeout error code. */
                 perr->err = RD_KAFKA_RESP_ERR__MSG_TIMED_OUT;
+
+        } else if (perr->err == RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED) {
+                /* If we're no longer authorized to access the topic mark
+                 * it as errored to deny further produce requests. */
+                rd_kafka_topic_wrlock(rktp->rktp_rkt);
+                rd_kafka_topic_set_error(rktp->rktp_rkt, perr->err);
+                rd_kafka_topic_wrunlock(rktp->rktp_rkt);
+        }
 
         return 1;
 }
@@ -2458,38 +3106,34 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
  * @locality broker thread (but not necessarily the leader broker thread)
  */
 static void
-rd_kafka_handle_idempotent_Produce_success (rd_kafka_t *rk,
-                                            rd_kafka_toppar_t *rktp,
-                                            rd_kafka_buf_t *request,
+rd_kafka_handle_idempotent_Produce_success (rd_kafka_broker_t *rkb,
+                                            rd_kafka_msgbatch_t *batch,
                                             int32_t next_seq) {
-        rd_kafka_broker_t *rkb = request->rkbuf_rkb;
+        rd_kafka_t *rk = rkb->rkb_rk;
+        rd_kafka_toppar_t *rktp = batch->rktp;
         char fatal_err[512];
         uint64_t first_msgid, last_msgid;
 
         *fatal_err = '\0';
 
-        first_msgid = rd_kafka_msgq_first(&request->rkbuf_msgq)->
-                rkm_u.producer.msgid;
-        last_msgid = rd_kafka_msgq_last(&request->rkbuf_msgq)->
-                rkm_u.producer.msgid;
+        first_msgid = rd_kafka_msgq_first(&batch->msgq)->rkm_u.producer.msgid;
+        last_msgid = rd_kafka_msgq_last(&batch->msgq)->rkm_u.producer.msgid;
 
         rd_kafka_toppar_lock(rktp);
 
         /* If the last acked msgid is higher than
          * the next message to (re)transmit in the message queue
          * it means a previous series of R1,R2 ProduceRequests
-         * had R1 fail with uncertain persistance status,
+         * had R1 fail with uncertain persistence status,
          * such as timeout or transport error, but R2 succeeded,
          * which means the messages in R1 were in fact persisted.
          * In this case trigger delivery reports for all messages
-         * in queue until we hit a non-acked message. */
+         * in queue until we hit a non-acked message msgid. */
         if (unlikely(rktp->rktp_eos.acked_msgid < first_msgid - 1)) {
                 rd_kafka_dr_implicit_ack(rkb, rktp, last_msgid);
 
-        } else if (unlikely(request->rkbuf_u.Produce.base_seq !=
-                            rktp->rktp_eos.next_ack_seq &&
-                            request->rkbuf_u.Produce.base_seq ==
-                            rktp->rktp_eos.next_err_seq)) {
+        } else if (unlikely(batch->first_seq != rktp->rktp_eos.next_ack_seq &&
+                            batch->first_seq == rktp->rktp_eos.next_err_seq)) {
                 /* Response ordering is typically not a concern
                  * (but will not happen with current broker versions),
                  * unless we're expecting an error to be returned at
@@ -2514,11 +3158,10 @@ rd_kafka_handle_idempotent_Produce_success (rd_kafka_t *rk,
                         "duplication/reordering",
                         RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                         rktp->rktp_partition,
-                        rd_kafka_msgq_len(&request->rkbuf_msgq),
+                        rd_kafka_msgq_len(&batch->msgq),
                         rkb->rkb_nodeid,
-                        rd_kafka_pid2str(request->rkbuf_u.
-                                         Produce.pid),
-                        request->rkbuf_u.Produce.base_seq,
+                        rd_kafka_pid2str(batch->pid),
+                        batch->first_seq,
                         rktp->rktp_eos.next_ack_seq,
                         rktp->rktp_eos.next_err_seq);
 
@@ -2534,7 +3177,6 @@ rd_kafka_handle_idempotent_Produce_success (rd_kafka_t *rk,
                         rktp->rktp_eos.next_err_seq = next_seq;
 
                 rktp->rktp_eos.next_ack_seq = next_seq;
-
         }
 
         /* Store the last acked message sequence,
@@ -2549,8 +3191,102 @@ rd_kafka_handle_idempotent_Produce_success (rd_kafka_t *rk,
         /* Must call set_fatal_error() after releasing
          * the toppar lock. */
         if (unlikely(*fatal_err))
-                rd_kafka_set_fatal_error(rk, RD_KAFKA_RESP_ERR__INCONSISTENT,
-                                         "%s", fatal_err);
+                rd_kafka_idemp_set_fatal_error(
+                        rk, RD_KAFKA_RESP_ERR__INCONSISTENT, "%s", fatal_err);
+}
+
+
+/**
+ * @brief Handle ProduceRequest result for a message batch.
+ *
+ * @warning \p request may be NULL.
+ *
+ * @localiy broker thread (but not necessarily the toppar's handler thread)
+ * @locks none
+ */
+static void
+rd_kafka_msgbatch_handle_Produce_result (
+        rd_kafka_broker_t *rkb,
+        rd_kafka_msgbatch_t *batch,
+        rd_kafka_resp_err_t err,
+        const struct rd_kafka_Produce_result *presult,
+        const rd_kafka_buf_t *request) {
+
+        rd_kafka_t *rk = rkb->rkb_rk;
+        rd_kafka_toppar_t *rktp = batch->rktp;
+        rd_kafka_msg_status_t status = RD_KAFKA_MSG_STATUS_POSSIBLY_PERSISTED;
+        rd_bool_t last_inflight;
+        int32_t next_seq;
+
+        /* Decrease partition's messages in-flight counter */
+        rd_assert(rd_atomic32_get(&rktp->rktp_msgs_inflight) >=
+                  rd_kafka_msgq_len(&batch->msgq));
+        last_inflight = !rd_atomic32_sub(&rktp->rktp_msgs_inflight,
+                                         rd_kafka_msgq_len(&batch->msgq));
+
+        /* Next expected sequence (and handle wrap) */
+        next_seq = rd_kafka_seq_wrap(batch->first_seq +
+                                     rd_kafka_msgq_len(&batch->msgq));
+
+        if (likely(!err)) {
+                rd_rkb_dbg(rkb, MSG, "MSGSET",
+                           "%s [%"PRId32"]: MessageSet with %i message(s) "
+                           "(MsgId %"PRIu64", BaseSeq %"PRId32") delivered",
+                           rktp->rktp_rkt->rkt_topic->str,
+                           rktp->rktp_partition,
+                           rd_kafka_msgq_len(&batch->msgq),
+                           batch->first_msgid, batch->first_seq);
+
+                if (rktp->rktp_rkt->rkt_conf.required_acks != 0)
+                        status = RD_KAFKA_MSG_STATUS_PERSISTED;
+
+                if (rd_kafka_is_idempotent(rk))
+                        rd_kafka_handle_idempotent_Produce_success(rkb, batch,
+                                                                   next_seq);
+        } else {
+                /* Error handling */
+                struct rd_kafka_Produce_err perr = {
+                        .err = err,
+                        .incr_retry = 1,
+                        .status = status,
+                        .update_next_ack = rd_true,
+                        .update_next_err = rd_true,
+                        .last_seq = (batch->first_seq +
+                                     rd_kafka_msgq_len(&batch->msgq) - 1)
+                };
+
+                rd_kafka_handle_Produce_error(rkb, request, batch, &perr);
+
+                /* Update next expected acked and/or err sequence. */
+                if (perr.update_next_ack || perr.update_next_err) {
+                        rd_kafka_toppar_lock(rktp);
+                        if (perr.update_next_ack)
+                                rktp->rktp_eos.next_ack_seq = next_seq;
+                        if (perr.update_next_err)
+                                rktp->rktp_eos.next_err_seq = next_seq;
+                        rd_kafka_toppar_unlock(rktp);
+                }
+
+                err    = perr.err;
+                status = perr.status;
+        }
+
+
+        /* Messages to retry will have been removed from the request's queue */
+        if (likely(rd_kafka_msgq_len(&batch->msgq) > 0)) {
+                /* Set offset, timestamp and status for each message. */
+                rd_kafka_msgq_set_metadata(&batch->msgq,
+                                           rkb->rkb_nodeid,
+                                           presult->offset,
+                                           presult->timestamp,
+                                           status);
+
+                /* Enqueue messages for delivery report. */
+                rd_kafka_dr_msgq(rktp->rktp_rkt, &batch->msgq, err);
+        }
+
+        if (rd_kafka_is_idempotent(rk) && last_inflight)
+                rd_kafka_idemp_inflight_toppar_sub(rk, rktp);
 }
 
 
@@ -2574,24 +3310,19 @@ static void rd_kafka_handle_Produce (rd_kafka_t *rk,
                                      rd_kafka_buf_t *reply,
                                      rd_kafka_buf_t *request,
                                      void *opaque) {
-        shptr_rd_kafka_toppar_t *s_rktp = request->rkbuf_u.Produce.s_rktp;
-        rd_kafka_toppar_t *rktp = rd_kafka_toppar_s2i(s_rktp);
-        int64_t offset = RD_KAFKA_OFFSET_INVALID;
-        int64_t timestamp = -1;
-        int last_inflight;
-        rd_kafka_msg_status_t status = RD_KAFKA_MSG_STATUS_POSSIBLY_PERSISTED;
-        int32_t next_seq;
-
-        /* Next expected sequence (and handle wrap) */
-        next_seq = rd_kafka_seq_wrap(request->rkbuf_u.Produce.base_seq +
-                                     rd_kafka_msgq_len(&request->rkbuf_msgq));
+        rd_kafka_msgbatch_t *batch = &request->rkbuf_batch;
+        rd_kafka_toppar_t *rktp = batch->rktp;
+        struct rd_kafka_Produce_result result = {
+                .offset = RD_KAFKA_OFFSET_INVALID,
+                .timestamp = -1
+        };
 
         /* Unit test interface: inject errors */
         if (unlikely(rk->rk_conf.ut.handle_ProduceResponse != NULL)) {
                 err = rk->rk_conf.ut.handle_ProduceResponse(
                         rkb->rkb_rk,
                         rkb->rkb_nodeid,
-                        request->rkbuf_u.Produce.base_msgid,
+                        batch->first_msgid,
                         err);
         }
 
@@ -2599,76 +3330,10 @@ static void rd_kafka_handle_Produce (rd_kafka_t *rk,
         if (!err && reply)
                 err = rd_kafka_handle_Produce_parse(rkb, rktp,
                                                     reply, request,
-                                                    &offset, &timestamp);
+                                                    &result);
 
-        /* Decrease partition's messages in-flight counter */
-        rd_assert(rd_atomic32_get(&rktp->rktp_msgs_inflight) >=
-                  rd_kafka_msgq_len(&request->rkbuf_msgq));
-        last_inflight =
-                !rd_atomic32_sub(&rktp->rktp_msgs_inflight,
-                                 rd_kafka_msgq_len(&request->rkbuf_msgq));
-
-        if (likely(!err)) {
-                rd_rkb_dbg(rkb, MSG, "MSGSET",
-                           "%s [%"PRId32"]: MessageSet with %i message(s) "
-                           "(MsgId %"PRIu64", BaseSeq %"PRId32") delivered",
-                           rktp->rktp_rkt->rkt_topic->str,
-                           rktp->rktp_partition,
-                           request->rkbuf_msgq.rkmq_msg_cnt,
-                           request->rkbuf_u.Produce.base_msgid,
-                           request->rkbuf_u.Produce.base_seq);
-
-                if (rktp->rktp_rkt->rkt_conf.required_acks != 0)
-                        status = RD_KAFKA_MSG_STATUS_PERSISTED;
-
-                if (rd_kafka_is_idempotent(rk))
-                        rd_kafka_handle_idempotent_Produce_success(rk, rktp,
-                                                                   request,
-                                                                   next_seq);
-        } else {
-                /* Error handling */
-                struct rd_kafka_Produce_err perr = {
-                        .err = err,
-                        .incr_retry = 1,
-                        .status = status,
-                        .update_next_ack = rd_true,
-                        .update_next_err = rd_true,
-                        .last_seq = request->rkbuf_u.Produce.base_seq +
-                        rd_kafka_msgq_len(&request->rkbuf_msgq) - 1
-                };
-
-                rd_kafka_handle_Produce_error(rkb, rktp,
-                                              reply, request,
-                                              &perr);
-
-                /* Update next expected acked and/or err sequence. */
-                if (perr.update_next_ack || perr.update_next_err) {
-                        rd_kafka_toppar_lock(rktp);
-                        if (perr.update_next_ack)
-                                rktp->rktp_eos.next_ack_seq = next_seq;
-                        if (perr.update_next_err)
-                                rktp->rktp_eos.next_err_seq = next_seq;
-                        rd_kafka_toppar_unlock(rktp);
-                }
-
-                err    = perr.err;
-                status = perr.status;
-        }
-
-
-        /* Messages to retry will have been removed from the request's queue */
-        if (likely(rd_kafka_msgq_len(&request->rkbuf_msgq) > 0)) {
-                /* Set offset, timestamp and status for each message. */
-                rd_kafka_msgq_set_metadata(&request->rkbuf_msgq, offset,
-                                           timestamp, status);
-
-
-                /* Enqueue messages for delivery report. */
-                rd_kafka_dr_msgq(rktp->rktp_rkt, &request->rkbuf_msgq, err);
-        }
-
-        if (rd_kafka_is_idempotent(rk) && last_inflight)
-                rd_kafka_idemp_inflight_toppar_sub(rk, rktp);
+        rd_kafka_msgbatch_handle_Produce_result(rkb, batch, err,
+                                                &result, request);
 }
 
 
@@ -2682,7 +3347,7 @@ static void rd_kafka_handle_Produce (rd_kafka_t *rk,
 int rd_kafka_ProduceRequest (rd_kafka_broker_t *rkb, rd_kafka_toppar_t *rktp,
                              const rd_kafka_pid_t pid) {
         rd_kafka_buf_t *rkbuf;
-        rd_kafka_itopic_t *rkt = rktp->rktp_rkt;
+        rd_kafka_topic_t *rkt = rktp->rktp_rkt;
         size_t MessageSetSize = 0;
         int cnt;
         rd_ts_t now;
@@ -2693,12 +3358,13 @@ int rd_kafka_ProduceRequest (rd_kafka_broker_t *rkb, rd_kafka_toppar_t *rktp,
          * Create ProduceRequest with as many messages from the toppar
          * transmit queue as possible.
          */
-        rkbuf = rd_kafka_msgset_create_ProduceRequest(rkb, rktp, pid,
-                                                      &MessageSetSize);
+        rkbuf = rd_kafka_msgset_create_ProduceRequest(rkb, rktp,
+                                                      &rktp->rktp_xmit_msgq,
+                                                      pid, &MessageSetSize);
         if (unlikely(!rkbuf))
                 return 0;
 
-        cnt = rkbuf->rkbuf_msgq.rkmq_msg_cnt;
+        cnt = rd_kafka_msgq_len(&rkbuf->rkbuf_batch.msgq);
         rd_dassert(cnt > 0);
 
         rd_avg_add(&rktp->rktp_rkt->rkt_avg_batchcnt, (int64_t)cnt);
@@ -2709,7 +3375,7 @@ int rd_kafka_ProduceRequest (rd_kafka_broker_t *rkb, rd_kafka_toppar_t *rktp,
 
         /* Use timeout from first message in batch */
         now = rd_clock();
-        first_msg_timeout = (TAILQ_FIRST(&rkbuf->rkbuf_msgq.rkmq_msgs)->
+        first_msg_timeout = (rd_kafka_msgq_first(&rkbuf->rkbuf_batch.msgq)->
                              rkm_ts_timeout - now) / 1000;
 
         if (unlikely(first_msg_timeout <= 0)) {
@@ -2724,19 +3390,6 @@ int rd_kafka_ProduceRequest (rd_kafka_broker_t *rkb, rd_kafka_toppar_t *rktp,
          * effective timeout for this specific request will be
          * capped by socket.timeout.ms */
         rd_kafka_buf_set_abs_timeout(rkbuf, tmout, now);
-
-        /* Keep track of number of requests in-flight per partition,
-         * and the number of partitions with in-flight requests when
-         * idempotent producer - this is used to drain partitions
-         * before resetting the PID. */
-        if (rd_atomic32_add(&rktp->rktp_msgs_inflight,
-                            rd_kafka_msgq_len(&rkbuf->rkbuf_msgq)) ==
-            rd_kafka_msgq_len(&rkbuf->rkbuf_msgq) &&
-            rd_kafka_is_idempotent(rkb->rkb_rk))
-                rd_kafka_idemp_inflight_toppar_add(rkb->rkb_rk, rktp);
-
-        /* Reference is dropped in buf_destroy() */
-        rkbuf->rkbuf_u.Produce.s_rktp = rd_kafka_toppar_keep(rktp);
 
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf,
                                        RD_KAFKA_NO_REPLYQ,
@@ -2775,6 +3428,7 @@ rd_kafka_CreateTopicsRequest (rd_kafka_broker_t *rkb,
 
         if (rd_list_cnt(new_topics) == 0) {
                 rd_snprintf(errstr, errstr_size, "No topics to create");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         }
 
@@ -2784,6 +3438,7 @@ rd_kafka_CreateTopicsRequest (rd_kafka_broker_t *rkb,
                 rd_snprintf(errstr, errstr_size,
                             "Topic Admin API (KIP-4) not supported "
                             "by broker, requires broker version >= 0.10.2.0");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
         }
 
@@ -2792,6 +3447,7 @@ rd_kafka_CreateTopicsRequest (rd_kafka_broker_t *rkb,
                 rd_snprintf(errstr, errstr_size,
                             "CreateTopics.validate_only=true not "
                             "supported by broker");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
         }
 
@@ -2917,6 +3573,7 @@ rd_kafka_DeleteTopicsRequest (rd_kafka_broker_t *rkb,
 
         if (rd_list_cnt(del_topics) == 0) {
                 rd_snprintf(errstr, errstr_size, "No topics to delete");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         }
 
@@ -2926,6 +3583,7 @@ rd_kafka_DeleteTopicsRequest (rd_kafka_broker_t *rkb,
                 rd_snprintf(errstr, errstr_size,
                             "Topic Admin API (KIP-4) not supported "
                             "by broker, requires broker version >= 0.10.2.0");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
         }
 
@@ -2985,6 +3643,7 @@ rd_kafka_CreatePartitionsRequest (rd_kafka_broker_t *rkb,
 
         if (rd_list_cnt(new_parts) == 0) {
                 rd_snprintf(errstr, errstr_size, "No partitions to create");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         }
 
@@ -2994,6 +3653,7 @@ rd_kafka_CreatePartitionsRequest (rd_kafka_broker_t *rkb,
                 rd_snprintf(errstr, errstr_size,
                             "CreatePartitions (KIP-195) not supported "
                             "by broker, requires broker version >= 1.0.0");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
         }
 
@@ -3090,6 +3750,7 @@ rd_kafka_AlterConfigsRequest (rd_kafka_broker_t *rkb,
         if (rd_list_cnt(configs) == 0) {
                 rd_snprintf(errstr, errstr_size,
                             "No config resources specified");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         }
 
@@ -3099,6 +3760,7 @@ rd_kafka_AlterConfigsRequest (rd_kafka_broker_t *rkb,
                 rd_snprintf(errstr, errstr_size,
                             "AlterConfigs (KIP-133) not supported "
                             "by broker, requires broker version >= 0.11.0");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
         }
 
@@ -3109,6 +3771,7 @@ rd_kafka_AlterConfigsRequest (rd_kafka_broker_t *rkb,
                             "AlterConfigs.incremental=true (KIP-248) "
                             "not supported by broker, "
                             "requires broker version >= 2.0.0");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
         }
 
@@ -3147,6 +3810,7 @@ rd_kafka_AlterConfigsRequest (rd_kafka_broker_t *rkb,
                                             "entries: only set supported "
                                             "by this broker");
                                 rd_kafka_buf_destroy(rkbuf);
+                                rd_kafka_replyq_destroy(&replyq);
                                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
                         }
                 }
@@ -3198,6 +3862,7 @@ rd_kafka_DescribeConfigsRequest (rd_kafka_broker_t *rkb,
         if (rd_list_cnt(configs) == 0) {
                 rd_snprintf(errstr, errstr_size,
                             "No config resources specified");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         }
 
@@ -3207,6 +3872,7 @@ rd_kafka_DescribeConfigsRequest (rd_kafka_broker_t *rkb,
                 rd_snprintf(errstr, errstr_size,
                             "DescribeConfigs (KIP-133) not supported "
                             "by broker, requires broker version >= 0.11.0");
+                rd_kafka_replyq_destroy(&replyq);
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
         }
 
@@ -3265,8 +3931,6 @@ rd_kafka_DescribeConfigsRequest (rd_kafka_broker_t *rkb,
 /**
  * @brief Parses and handles an InitProducerId reply.
  *
- * @returns 0 on success, else an error.
- *
  * @locality rdkafka main thread
  * @locks none
  */
@@ -3300,16 +3964,20 @@ rd_kafka_handle_InitProducerId (rd_kafka_t *rk,
  err_parse:
         err = rkbuf->rkbuf_err;
  err:
+        if (err == RD_KAFKA_RESP_ERR__DESTROY)
+                return;
+
         /* Retries are performed by idempotence state handler */
         rd_kafka_idemp_request_pid_failed(rkb, err);
 }
 
-
 /**
  * @brief Construct and send InitProducerIdRequest to \p rkb.
  *
- *        \p transactional_id may be NULL.
- *        \p transaction_timeout_ms may be set to -1.
+ * @param transactional_id may be NULL.
+ * @param transaction_timeout_ms may be set to -1.
+ * @param current_pid may be NULL and will be ignored if KIP360 is not
+ *                    supportedb by the broker.
  *
  *        The response (unparsed) will be handled by \p resp_cb served
  *        by queue \p replyq.
@@ -3322,12 +3990,13 @@ rd_kafka_resp_err_t
 rd_kafka_InitProducerIdRequest (rd_kafka_broker_t *rkb,
                                 const char *transactional_id,
                                 int transaction_timeout_ms,
+                                const rd_kafka_pid_t *current_pid,
                                 char *errstr, size_t errstr_size,
                                 rd_kafka_replyq_t replyq,
                                 rd_kafka_resp_cb_t *resp_cb,
                                 void *opaque) {
         rd_kafka_buf_t *rkbuf;
-        int16_t ApiVersion = 0;
+        int16_t ApiVersion;
 
         ApiVersion = rd_kafka_broker_ApiVersion_supported(
                 rkb, RD_KAFKAP_InitProducerId, 0, 1, NULL);
@@ -3342,7 +4011,7 @@ rd_kafka_InitProducerIdRequest (rd_kafka_broker_t *rkb,
         rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_InitProducerId, 1,
                                          2 + (transactional_id ?
                                               strlen(transactional_id) : 0) +
-                                         4);
+                                         4 + 8 + 4);
 
         /* transactional_id */
         rd_kafka_buf_write_str(rkbuf, transactional_id, -1);
@@ -3350,12 +4019,511 @@ rd_kafka_InitProducerIdRequest (rd_kafka_broker_t *rkb,
         /* transaction_timeout_ms */
         rd_kafka_buf_write_i32(rkbuf, transaction_timeout_ms);
 
+        if (ApiVersion >= 2) {
+                /* Current PID */
+                rd_kafka_buf_write_i64(rkbuf,
+                                       current_pid ? current_pid->id : -1);
+                /* Current Epoch */
+                rd_kafka_buf_write_i64(rkbuf,
+                                       current_pid ? current_pid->epoch : -1);
+        }
+
         rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
 
         /* Let the idempotence state handler perform retries */
-        rkbuf->rkbuf_retries = RD_KAFKA_BUF_NO_RETRIES;
+        rkbuf->rkbuf_max_retries = RD_KAFKA_BUF_NO_RETRIES;
 
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
 
         return RD_KAFKA_RESP_ERR_NO_ERROR;
 }
+
+
+/**
+ * @brief Construct and send AddPartitionsToTxnRequest to \p rkb.
+ *
+ *        The response (unparsed) will be handled by \p resp_cb served
+ *        by queue \p replyq.
+ *
+ * @param rktps MUST be sorted by topic name.
+ *
+ *
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR if the request was enqueued for
+ *          transmission, otherwise an error code.
+ */
+rd_kafka_resp_err_t
+rd_kafka_AddPartitionsToTxnRequest (rd_kafka_broker_t *rkb,
+                                    const char *transactional_id,
+                                    rd_kafka_pid_t pid,
+                                    const rd_kafka_toppar_tqhead_t *rktps,
+                                    char *errstr, size_t errstr_size,
+                                    rd_kafka_replyq_t replyq,
+                                    rd_kafka_resp_cb_t *resp_cb,
+                                    void *opaque) {
+        rd_kafka_buf_t *rkbuf;
+        int16_t ApiVersion = 0;
+        rd_kafka_toppar_t *rktp;
+        rd_kafka_topic_t *last_rkt = NULL;
+        size_t of_TopicCnt;
+        ssize_t of_PartCnt = -1;
+        int TopicCnt = 0, PartCnt = 0;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                rkb, RD_KAFKAP_AddPartitionsToTxn, 0, 0, NULL);
+        if (ApiVersion == -1) {
+                rd_snprintf(errstr, errstr_size,
+                            "AddPartitionsToTxnRequest (KIP-98) not supported "
+                            "by broker, requires broker version >= 0.11.0");
+                rd_kafka_replyq_destroy(&replyq);
+                return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+        }
+
+        rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_AddPartitionsToTxn, 1,
+                                         500);
+
+        /* transactional_id */
+        rd_kafka_buf_write_str(rkbuf, transactional_id, -1);
+
+        /* PID */
+        rd_kafka_buf_write_i64(rkbuf, pid.id);
+        rd_kafka_buf_write_i16(rkbuf, pid.epoch);
+
+        /* Topics/partitions array (count updated later) */
+        of_TopicCnt = rd_kafka_buf_write_i32(rkbuf, 0);
+
+        TAILQ_FOREACH(rktp, rktps, rktp_txnlink) {
+                if (last_rkt != rktp->rktp_rkt) {
+
+                        if (last_rkt) {
+                                /* Update last topic's partition count field */
+                                rd_kafka_buf_update_i32(rkbuf, of_PartCnt,
+                                                        PartCnt);
+                                of_PartCnt = -1;
+                        }
+
+                        /* Topic name */
+                        rd_kafka_buf_write_kstr(rkbuf,
+                                                rktp->rktp_rkt->rkt_topic);
+                        /* Partition count, updated later */
+                        of_PartCnt = rd_kafka_buf_write_i32(rkbuf, 0);
+
+                        PartCnt = 0;
+                        TopicCnt++;
+                        last_rkt = rktp->rktp_rkt;
+                }
+
+                /* Partition id */
+                rd_kafka_buf_write_i32(rkbuf, rktp->rktp_partition);
+                PartCnt++;
+        }
+
+        /* Update last partition and topic count fields */
+        if (of_PartCnt != -1)
+                rd_kafka_buf_update_i32(rkbuf, (size_t)of_PartCnt, PartCnt);
+        rd_kafka_buf_update_i32(rkbuf, of_TopicCnt, TopicCnt);
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
+
+        /* Let the handler perform retries so that it can pick
+         * up more added partitions. */
+        rkbuf->rkbuf_max_retries = RD_KAFKA_BUF_NO_RETRIES;
+
+        rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
+
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+
+/**
+ * @brief Construct and send AddOffsetsToTxnRequest to \p rkb.
+ *
+ *        The response (unparsed) will be handled by \p resp_cb served
+ *        by queue \p replyq.
+ *
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR if the request was enqueued for
+ *          transmission, otherwise an error code.
+ */
+rd_kafka_resp_err_t
+rd_kafka_AddOffsetsToTxnRequest (rd_kafka_broker_t *rkb,
+                                 const char *transactional_id,
+                                 rd_kafka_pid_t pid,
+                                 const char *group_id,
+                                 char *errstr, size_t errstr_size,
+                                 rd_kafka_replyq_t replyq,
+                                 rd_kafka_resp_cb_t *resp_cb,
+                                 void *opaque) {
+        rd_kafka_buf_t *rkbuf;
+        int16_t ApiVersion = 0;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                rkb, RD_KAFKAP_AddOffsetsToTxn, 0, 0, NULL);
+        if (ApiVersion == -1) {
+                rd_snprintf(errstr, errstr_size,
+                            "AddOffsetsToTxnRequest (KIP-98) not supported "
+                            "by broker, requires broker version >= 0.11.0");
+                rd_kafka_replyq_destroy(&replyq);
+                return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+        }
+
+        rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_AddOffsetsToTxn, 1,
+                                         100);
+
+        /* transactional_id */
+        rd_kafka_buf_write_str(rkbuf, transactional_id, -1);
+
+        /* PID */
+        rd_kafka_buf_write_i64(rkbuf, pid.id);
+        rd_kafka_buf_write_i16(rkbuf, pid.epoch);
+
+        /* Group Id */
+        rd_kafka_buf_write_str(rkbuf, group_id, -1);
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
+
+        rkbuf->rkbuf_max_retries = 3;
+
+        rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
+
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+
+
+/**
+ * @brief Construct and send EndTxnRequest to \p rkb.
+ *
+ *        The response (unparsed) will be handled by \p resp_cb served
+ *        by queue \p replyq.
+ *
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR if the request was enqueued for
+ *          transmission, otherwise an error code.
+ */
+rd_kafka_resp_err_t
+rd_kafka_EndTxnRequest (rd_kafka_broker_t *rkb,
+                        const char *transactional_id,
+                        rd_kafka_pid_t pid,
+                        rd_bool_t committed,
+                        char *errstr, size_t errstr_size,
+                        rd_kafka_replyq_t replyq,
+                        rd_kafka_resp_cb_t *resp_cb,
+                        void *opaque) {
+        rd_kafka_buf_t *rkbuf;
+        int16_t ApiVersion = 0;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                rkb, RD_KAFKAP_EndTxn, 0, 1, NULL);
+        if (ApiVersion == -1) {
+                rd_snprintf(errstr, errstr_size,
+                            "EndTxnRequest (KIP-98) not supported "
+                            "by broker, requires broker version >= 0.11.0");
+                rd_kafka_replyq_destroy(&replyq);
+                return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+        }
+
+        rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_EndTxn, 1,
+                                         500);
+
+        /* transactional_id */
+        rd_kafka_buf_write_str(rkbuf, transactional_id, -1);
+
+        /* PID */
+        rd_kafka_buf_write_i64(rkbuf, pid.id);
+        rd_kafka_buf_write_i16(rkbuf, pid.epoch);
+
+        /* Committed */
+        rd_kafka_buf_write_bool(rkbuf, committed);
+
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
+
+        /* Let the handler perform retries */
+        rkbuf->rkbuf_max_retries = RD_KAFKA_BUF_NO_RETRIES;
+
+        rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
+
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+
+
+/**
+ * @name Unit tests
+ * @{
+ *
+ *
+ *
+ *
+ */
+
+/**
+ * @brief Create \p cnt messages, starting at \p msgid, and add them
+ *        to \p rkmq.
+ *
+ * @returns the number of messages added.
+ */
+static int
+ut_create_msgs (rd_kafka_msgq_t *rkmq, uint64_t msgid, int cnt) {
+        int i;
+
+        for (i = 0 ; i < cnt ; i++) {
+                rd_kafka_msg_t *rkm;
+
+                rkm = ut_rd_kafka_msg_new(0);
+                rkm->rkm_u.producer.msgid = msgid++;
+
+                rd_kafka_msgq_enq(rkmq, rkm);
+        }
+
+        return cnt;
+}
+
+/**
+ * @brief Idempotent Producer request/response unit tests
+ *
+ * The current test verifies proper handling of the following case:
+ *    Batch 0 succeeds
+ *    Batch 1 fails with temporary error
+ *    Batch 2,3 fails with out of order sequence
+ *    Retry Batch 1-3 should succeed.
+ */
+static int unittest_idempotent_producer (void) {
+        rd_kafka_t *rk;
+        rd_kafka_conf_t *conf;
+        rd_kafka_broker_t *rkb;
+#define _BATCH_CNT 4
+#define _MSGS_PER_BATCH 3
+        const int msgcnt = _BATCH_CNT * _MSGS_PER_BATCH;
+        int remaining_batches;
+        uint64_t msgid = 1;
+        rd_kafka_toppar_t *rktp;
+        rd_kafka_pid_t pid = { .id = 1000, .epoch = 0 };
+        struct rd_kafka_Produce_result result = {
+                .offset = 1,
+                .timestamp = 1000
+        };
+        rd_kafka_queue_t *rkqu;
+        rd_kafka_event_t *rkev;
+        rd_kafka_buf_t *request[_BATCH_CNT];
+        int rcnt = 0;
+        int retry_msg_cnt = 0;
+        int drcnt = 0;
+        rd_kafka_msgq_t rkmq = RD_KAFKA_MSGQ_INITIALIZER(rkmq);
+        int i, r;
+
+        RD_UT_SAY("Verifying idempotent producer error handling");
+
+        conf = rd_kafka_conf_new();
+        rd_kafka_conf_set(conf, "batch.num.messages", "3", NULL, 0);
+        rd_kafka_conf_set(conf, "retry.backoff.ms", "1", NULL, 0);
+        if (rd_kafka_conf_set(conf, "enable.idempotence", "true", NULL, 0) !=
+            RD_KAFKA_CONF_OK)
+                RD_UT_FAIL("Failed to enable idempotence");
+        rd_kafka_conf_set_events(conf, RD_KAFKA_EVENT_DR);
+
+        rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, NULL, 0);
+        RD_UT_ASSERT(rk, "failed to create producer");
+
+        rkqu = rd_kafka_queue_get_main(rk);
+
+        /* We need a broker handle, use a logical broker to avoid
+         * any connection attempts. */
+        rkb = rd_kafka_broker_add_logical(rk, "unittest");
+
+        /* Have the broker support everything so msgset_writer selects
+         * the most up-to-date output features. */
+        rd_kafka_broker_lock(rkb);
+        rkb->rkb_features = RD_KAFKA_FEATURE_UNITTEST | RD_KAFKA_FEATURE_ALL;
+        rd_kafka_broker_unlock(rkb);
+
+        /* Get toppar */
+        rktp = rd_kafka_toppar_get2(rk, "uttopic", 0, rd_false, rd_true);
+        RD_UT_ASSERT(rktp, "failed to get toppar");
+
+        /* Set the topic as exists so messages are enqueued on
+         * the desired rktp away (otherwise UA partition) */
+        rd_ut_kafka_topic_set_topic_exists(rktp->rktp_rkt, 1, -1);
+
+        /* Produce messages */
+        ut_create_msgs(&rkmq, 1, msgcnt);
+
+        /* Set the pid */
+        rd_kafka_idemp_set_state(rk, RD_KAFKA_IDEMP_STATE_WAIT_PID);
+        rd_kafka_idemp_pid_update(rkb, pid);
+        pid = rd_kafka_idemp_get_pid(rk);
+        RD_UT_ASSERT(rd_kafka_pid_valid(pid), "PID is invalid");
+        rd_kafka_toppar_pid_change(rktp, pid, msgid);
+
+        remaining_batches = _BATCH_CNT;
+
+        /* Create a ProduceRequest for each batch */
+        for (rcnt = 0 ; rcnt < remaining_batches ; rcnt++) {
+                size_t msize;
+                request[rcnt] = rd_kafka_msgset_create_ProduceRequest(
+                        rkb, rktp, &rkmq, rd_kafka_idemp_get_pid(rk), &msize);
+                RD_UT_ASSERT(request[rcnt], "request #%d failed", rcnt);
+        }
+
+        RD_UT_ASSERT(rd_kafka_msgq_len(&rkmq) == 0,
+                     "expected input message queue to be empty, "
+                     "but still has %d message(s)",
+                     rd_kafka_msgq_len(&rkmq));
+
+        /*
+         * Mock handling of each request
+         */
+
+        /* Batch 0: accepted */
+        i = 0;
+        r = rd_kafka_msgq_len(&request[i]->rkbuf_batch.msgq);
+        RD_UT_ASSERT(r == _MSGS_PER_BATCH, ".");
+        rd_kafka_msgbatch_handle_Produce_result(
+                rkb, &request[i]->rkbuf_batch,
+                RD_KAFKA_RESP_ERR_NO_ERROR,
+                &result, request[i]);
+        result.offset += r;
+        RD_UT_ASSERT(rd_kafka_msgq_len(&rktp->rktp_msgq) == 0,
+                     "batch %d: expected no messages in rktp_msgq, not %d",
+                     i, rd_kafka_msgq_len(&rktp->rktp_msgq));
+        rd_kafka_buf_destroy(request[i]);
+        remaining_batches--;
+
+        /* Batch 1: fail, triggering retry (re-enq on rktp_msgq) */
+        i = 1;
+        r = rd_kafka_msgq_len(&request[i]->rkbuf_batch.msgq);
+        RD_UT_ASSERT(r == _MSGS_PER_BATCH, ".");
+        rd_kafka_msgbatch_handle_Produce_result(
+                rkb, &request[i]->rkbuf_batch,
+                RD_KAFKA_RESP_ERR_NOT_LEADER_FOR_PARTITION,
+                &result, request[i]);
+        retry_msg_cnt += r;
+        RD_UT_ASSERT(rd_kafka_msgq_len(&rktp->rktp_msgq) == retry_msg_cnt,
+                     "batch %d: expected %d messages in rktp_msgq, not %d",
+                     i, retry_msg_cnt,
+                     rd_kafka_msgq_len(&rktp->rktp_msgq));
+        rd_kafka_buf_destroy(request[i]);
+
+        /* Batch 2: OUT_OF_ORDER, triggering retry .. */
+        i = 2;
+        r = rd_kafka_msgq_len(&request[i]->rkbuf_batch.msgq);
+        RD_UT_ASSERT(r == _MSGS_PER_BATCH, ".");
+        rd_kafka_msgbatch_handle_Produce_result(
+                rkb, &request[i]->rkbuf_batch,
+                RD_KAFKA_RESP_ERR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+                &result, request[i]);
+        retry_msg_cnt += r;
+        RD_UT_ASSERT(rd_kafka_msgq_len(&rktp->rktp_msgq) == retry_msg_cnt,
+                     "batch %d: expected %d messages in rktp_xmit_msgq, not %d",
+                     i, retry_msg_cnt,
+                     rd_kafka_msgq_len(&rktp->rktp_msgq));
+        rd_kafka_buf_destroy(request[i]);
+
+        /* Batch 3: OUT_OF_ORDER, triggering retry .. */
+        i = 3;
+        r = rd_kafka_msgq_len(&request[i]->rkbuf_batch.msgq);
+        rd_kafka_msgbatch_handle_Produce_result(
+                rkb, &request[i]->rkbuf_batch,
+                RD_KAFKA_RESP_ERR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+                &result, request[i]);
+        retry_msg_cnt += r;
+        RD_UT_ASSERT(rd_kafka_msgq_len(&rktp->rktp_msgq) == retry_msg_cnt,
+                     "batch %d: expected %d messages in rktp_xmit_msgq, not %d",
+                     i, retry_msg_cnt,
+                     rd_kafka_msgq_len(&rktp->rktp_msgq));
+        rd_kafka_buf_destroy(request[i]);
+
+
+        /* Retried messages will have been moved to rktp_msgq,
+         * move them back to our local queue. */
+        rd_kafka_toppar_lock(rktp);
+        rd_kafka_msgq_move(&rkmq, &rktp->rktp_msgq);
+        rd_kafka_toppar_unlock(rktp);
+
+        RD_UT_ASSERT(rd_kafka_msgq_len(&rkmq) == retry_msg_cnt,
+                     "Expected %d messages in retry queue, not %d",
+                     retry_msg_cnt, rd_kafka_msgq_len(&rkmq));
+
+        /* Sleep a short while to make sure the retry backoff expires. */
+        rd_usleep(5*1000, NULL); /* 5ms */
+
+        /*
+         * Create requests for remaining batches.
+         */
+        for (rcnt = 0 ; rcnt < remaining_batches ; rcnt++) {
+                size_t msize;
+                request[rcnt] = rd_kafka_msgset_create_ProduceRequest(
+                        rkb, rktp, &rkmq, rd_kafka_idemp_get_pid(rk), &msize);
+                RD_UT_ASSERT(request[rcnt],
+                             "Failed to create retry #%d (%d msgs in queue)",
+                             rcnt, rd_kafka_msgq_len(&rkmq));
+        }
+
+        /*
+         * Mock handling of each request, they will now succeed.
+         */
+        for (i = 0 ; i < rcnt ; i++) {
+                r = rd_kafka_msgq_len(&request[i]->rkbuf_batch.msgq);
+                rd_kafka_msgbatch_handle_Produce_result(
+                        rkb, &request[i]->rkbuf_batch,
+                        RD_KAFKA_RESP_ERR_NO_ERROR,
+                        &result, request[i]);
+                result.offset += r;
+                rd_kafka_buf_destroy(request[i]);
+        }
+
+        retry_msg_cnt = 0;
+        RD_UT_ASSERT(rd_kafka_msgq_len(&rktp->rktp_msgq) == retry_msg_cnt,
+                     "batch %d: expected %d messages in rktp_xmit_msgq, not %d",
+                     i, retry_msg_cnt,
+                     rd_kafka_msgq_len(&rktp->rktp_msgq));
+
+        /*
+         * Wait for delivery reports, they should all be successful.
+         */
+        while ((rkev = rd_kafka_queue_poll(rkqu, 1000))) {
+                const rd_kafka_message_t *rkmessage;
+
+                RD_UT_SAY("Got %s event with %d message(s)",
+                          rd_kafka_event_name(rkev),
+                          (int)rd_kafka_event_message_count(rkev));
+
+                while ((rkmessage = rd_kafka_event_message_next(rkev))) {
+                        RD_UT_SAY(" DR for message: %s: (persistence=%d)",
+                                  rd_kafka_err2str(rkmessage->err),
+                                  rd_kafka_message_status(rkmessage));
+                        if (rkmessage->err)
+                                RD_UT_WARN(" ^ Should not have failed");
+                        else
+                                drcnt++;
+                }
+                rd_kafka_event_destroy(rkev);
+        }
+
+        /* Should be no more messages in queues */
+        r = rd_kafka_outq_len(rk);
+        RD_UT_ASSERT(r == 0, "expected outq to return 0, not %d", r);
+
+        /* Verify the expected number of good delivery reports were seen */
+        RD_UT_ASSERT(drcnt == msgcnt,
+                     "expected %d DRs, not %d", msgcnt, drcnt);
+
+        rd_kafka_queue_destroy(rkqu);
+        rd_kafka_toppar_destroy(rktp);
+        rd_kafka_broker_destroy(rkb);
+        rd_kafka_destroy(rk);
+
+        RD_UT_PASS();
+        return 0;
+}
+
+/**
+ * @brief Request/response unit tests
+ */
+int unittest_request (void) {
+        int fails = 0;
+
+        fails += unittest_idempotent_producer();
+
+        return fails;
+}
+
+/**@}*/

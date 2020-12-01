@@ -3,24 +3,24 @@
  *
  * Copyright (c) 2012, Magnus Edenhill
  * All rights reserved.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met: 
- * 
+ * modification, are permitted provided that the following conditions are met:
+ *
  * 1. Redistributions of source code must retain the above copyright notice,
- *    this list of conditions and the following disclaimer. 
+ *    this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright notice,
  *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution. 
- * 
+ *    and/or other materials provided with the distribution.
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE 
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE 
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE 
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR 
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF 
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN 
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
  * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
@@ -52,13 +52,13 @@
 #include "rd.h"
 #include "rdtime.h"
 
-#ifdef _MSC_VER
+#ifdef _WIN32
 #include "../win32/wingetopt.h"
 #include "../win32/wintime.h"
 #endif
 
 
-static int run = 1;
+static volatile sig_atomic_t run = 1;
 static int forever = 1;
 static rd_ts_t dispintvl = 1000;
 static int do_seq = 0;
@@ -188,7 +188,7 @@ static void msg_delivered (rd_kafka_t *rk,
 	rd_ts_t now = rd_clock();
 	static int msgs;
 
-	msgs++;
+        msgs++;
 
 	msgs_wait_cnt--;
 
@@ -212,7 +212,7 @@ static void msg_delivered (rd_kafka_t *rk,
 	     (cnt.msgs_dr_err < 50 ||
               !(cnt.msgs_dr_err % (dispintvl / 1000)))) ||
 	    !last || msgs_wait_cnt < 5 ||
-	    !(msgs_wait_cnt % dr_disp_div) || 
+	    !(msgs_wait_cnt % dr_disp_div) ||
 	    (now - last) >= dispintvl * 1000 ||
             verbosity >= 3) {
 		if (rkmessage->err && verbosity >= 2)
@@ -236,8 +236,13 @@ static void msg_delivered (rd_kafka_t *rk,
         cnt.last_offset = rkmessage->offset;
 
 	if (msgs_wait_produce_cnt == 0 && msgs_wait_cnt == 0 && !forever) {
-		if (verbosity >= 2)
-			printf("All messages delivered!\n");
+                if (verbosity >= 2 && cnt.msgs > 0) {
+                        double error_percent =
+                                (double)(cnt.msgs - cnt.msgs_dr_ok) /
+                                cnt.msgs * 100;
+                        printf("%% Messages delivered with failure "
+                               "percentage of %.5f%%\n", error_percent);
+                }
 		t_end = rd_clock();
 		run = 0;
 	}
@@ -334,33 +339,66 @@ static void msg_consume (rd_kafka_message_t *rkmessage, void *opaque) {
 
 
 static void rebalance_cb (rd_kafka_t *rk,
-			  rd_kafka_resp_err_t err,
-			  rd_kafka_topic_partition_list_t *partitions,
-			  void *opaque) {
+                          rd_kafka_resp_err_t err,
+                          rd_kafka_topic_partition_list_t *partitions,
+                          void *opaque) {
+        rd_kafka_error_t *error = NULL;
+        rd_kafka_resp_err_t ret_err = RD_KAFKA_RESP_ERR_NO_ERROR;
 
-	switch (err)
-	{
-	case RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS:
-		fprintf(stderr,
-			"%% Group rebalanced: %d partition(s) assigned\n",
-			partitions->cnt);
-		eof_cnt = 0;
-		partition_cnt = partitions->cnt;
-		rd_kafka_assign(rk, partitions);
-		break;
+        if (exit_eof &&
+            !strcmp(rd_kafka_rebalance_protocol(rk), "COOPERATIVE"))
+                fprintf(stderr, "%% This example has not been modified to "
+                        "support -e (exit on EOF) when "
+                        "partition.assignment.strategy "
+                        "is set to an incremental/cooperative strategy: "
+                        "-e will not behave as expected\n");
 
-	case RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS:
-		fprintf(stderr,
-			"%% Group rebalanced: %d partition(s) revoked\n",
-			partitions->cnt);
-		eof_cnt = 0;
-		partition_cnt = 0;
-		rd_kafka_assign(rk, NULL);
-		break;
+        switch (err)
+        {
+        case RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS:
+                fprintf(stderr,
+                        "%% Group rebalanced (%s): "
+                        "%d new partition(s) assigned\n",
+                        rd_kafka_rebalance_protocol(rk), partitions->cnt);
 
-	default:
-		break;
-	}
+                if (!strcmp(rd_kafka_rebalance_protocol(rk), "COOPERATIVE")) {
+                        error = rd_kafka_incremental_assign(rk, partitions);
+                } else {
+                        ret_err = rd_kafka_assign(rk, partitions);
+                        eof_cnt = 0;
+                }
+
+                partition_cnt += partitions->cnt;
+                break;
+
+        case RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS:
+                fprintf(stderr,
+                        "%% Group rebalanced (%s): %d partition(s) revoked\n",
+                        rd_kafka_rebalance_protocol(rk), partitions->cnt);
+
+                if (!strcmp(rd_kafka_rebalance_protocol(rk), "COOPERATIVE")) {
+                        error = rd_kafka_incremental_unassign(rk, partitions);
+                        partition_cnt -= partitions->cnt;
+                } else {
+                        ret_err = rd_kafka_assign(rk, NULL);
+                        partition_cnt = 0;
+                }
+
+                eof_cnt = 0; /* FIXME: Not correct for incremental case */
+                break;
+
+        default:
+                break;
+        }
+
+        if (error) {
+                fprintf(stderr, "%% incremental assign failure: %s\n",
+                        rd_kafka_error_string(error));
+                rd_kafka_error_destroy(error);
+        } else if (ret_err) {
+                fprintf(stderr, "%% assign failure: %s\n",
+                        rd_kafka_err2str(ret_err));
+        }
 }
 
 
@@ -769,7 +807,7 @@ static rd_kafka_resp_err_t do_produce (rd_kafka_t *rk,
  */
 static void do_sleep (int sleep_us) {
         if (sleep_us > 100) {
-#ifdef _MSC_VER
+#ifdef _WIN32
                 Sleep(sleep_us / 1000);
 #else
                 usleep(sleep_us);
@@ -858,7 +896,7 @@ int main (int argc, char **argv) {
 	while ((opt =
 		getopt(argc, argv,
 		       "PCG:t:p:b:s:k:c:fi:MDd:m:S:x:"
-                       "R:a:z:o:X:B:eT:Y:qvIur:lA:OwNHH:")) != -1) {
+                       "R:a:z:o:X:B:eT:Y:qvIur:lA:OwNH:")) != -1) {
 		switch (opt) {
 		case 'G':
 			if (rd_kafka_conf_set(conf, "group.id", optarg,
@@ -957,37 +995,32 @@ int main (int argc, char **argv) {
 		case 'd':
 			debug = optarg;
 			break;
-                case 'H':
-                {
-                        char *name, *val;
-                        size_t name_sz = -1;
+        case 'H':
+            if (!strcmp(optarg, "parse"))
+                read_hdrs = 1;
+            else {
+                char *name, *val;
+                size_t name_sz = -1;
 
-                        if (!optarg) {
-                                read_hdrs = 1;
-                                break;
-                        }
-
-                        name = optarg;
-                        val = strchr(name, '=');
-                        if (val) {
-                                name_sz = (size_t)(val-name);
-                                val++; /* past the '=' */
-                        }
-
-                        if (!hdrs)
-                                hdrs = rd_kafka_headers_new(8);
-
-                        err = rd_kafka_header_add(hdrs, name, name_sz, val, -1);
-                        if (err) {
-                                fprintf(stderr,
-                                        "%% Failed to add header %s: %s\n",
-                                        name, rd_kafka_err2str(err));
-                                exit(1);
-                        }
-
-                        read_hdrs = 1;
+                name = optarg;
+                val = strchr(name, '=');
+                if (val) {
+                        name_sz = (size_t)(val-name);
+                        val++; /* past the '=' */
                 }
-                break;
+
+                if (!hdrs)
+                        hdrs = rd_kafka_headers_new(8);
+
+                err = rd_kafka_header_add(hdrs, name, name_sz, val, -1);
+                if (err) {
+                        fprintf(stderr,
+                                "%% Failed to add header %s: %s\n",
+                                name, rd_kafka_err2str(err));
+                        exit(1);
+                }
+            }
+            break;
 		case 'X':
 		{
 			char *name, *val;
@@ -1126,8 +1159,8 @@ int main (int argc, char **argv) {
 			"  -b <brokers> Broker address list (host[:port],..)\n"
 			"  -s <size>    Message size (producer)\n"
 			"  -k <key>     Message key (producer)\n"
-                        "  -H <name[=value]> Add header to message (producer)\n"
-                        "  -H           Read message headers (consumer)\n"
+            "  -H <name[=value]> Add header to message (producer)\n"
+            "  -H parse     Read message headers (consumer)\n"
 			"  -c <cnt>     Messages to transmit/receive\n"
 			"  -x <cnt>     Hard exit after transmitting <cnt> messages (producer)\n"
 			"  -D           Copy/Duplicate data buffer (producer)\n"
@@ -1258,9 +1291,15 @@ int main (int argc, char **argv) {
         if (stats_intvlstr) {
                 /* User enabled stats (-T) */
 
-#ifndef _MSC_VER
+#ifndef _WIN32
                 if (stats_cmd) {
-                        if (!(stats_fp = popen(stats_cmd, "we"))) {
+                        if (!(stats_fp = popen(stats_cmd,
+#ifdef __linux__
+                                               "we"
+#else
+                                               "w"
+#endif
+                                               ))) {
                                 fprintf(stderr,
                                         "%% Failed to start stats command: "
                                         "%s: %s", stats_cmd, strerror(errno));
@@ -1282,6 +1321,15 @@ int main (int argc, char **argv) {
         if (mode == 'C' || mode == 'G')
                 rd_kafka_conf_set(conf, "enable.partition.eof", "true",
                                   NULL, 0);
+    if (read_hdrs && mode == 'P') {
+        fprintf(stderr, "%% producer can not read headers\n");
+        exit(1);
+    }
+    
+    if (hdrs && mode != 'P') {
+        fprintf(stderr, "%% consumer can not add headers\n");
+        exit(1);
+    }
 
 	if (mode == 'P') {
 		/*
@@ -1462,6 +1510,7 @@ int main (int argc, char **argv) {
 		outq = rd_kafka_outq_len(rk);
                 if (verbosity >= 2)
                         printf("%% %i messages in outq\n", outq);
+		cnt.msgs -= outq;
 		cnt.t_end = t_end;
 
 		if (cnt.tx_err > 0)
@@ -1537,7 +1586,6 @@ int main (int argc, char **argv) {
 			fetch_latency = rd_clock();
 
 			if (batch_size) {
-				int i;
 				int partition = partitions ? partitions[0] :
 				    RD_KAFKA_PARTITION_UA;
 
@@ -1547,7 +1595,7 @@ int main (int argc, char **argv) {
 							   rkmessages,
 							   batch_size);
 				if (r != -1) {
-					for (i = 0 ; i < r ; i++) {
+					for (i = 0 ; (ssize_t)i < r ; i++) {
 						msg_consume(rkmessages[i],
 							NULL);
 						rd_kafka_message_destroy(
@@ -1605,7 +1653,6 @@ int main (int argc, char **argv) {
 		/*
 		 * High-level balanced Consumer
 		 */
-		rd_kafka_resp_err_t err;
 
 		rd_kafka_conf_set_rebalance_cb(conf, rebalance_cb);
 		rd_kafka_conf_set_default_topic_conf(conf, topic_conf);
@@ -1686,7 +1733,7 @@ int main (int argc, char **argv) {
 		fclose(latency_fp);
 
         if (stats_fp) {
-#ifndef _MSC_VER
+#ifndef _WIN32
                 pclose(stats_fp);
 #endif
                 stats_fp = NULL;
