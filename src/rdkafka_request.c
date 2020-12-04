@@ -940,11 +940,15 @@ static int rd_kafka_handle_OffsetCommit_error (
         return rd_kafka_err_action(
                 rkb, rktpar->err, request,
 
-                RD_KAFKA_ERR_ACTION_PERMANENT,
+                /** what about other auth failures? */
+                rkb->rkb_rk->rk_conf.retry_authorization_failed ?
+                        RD_KAFKA_ERR_ACTION_RETRY :
+                        RD_KAFKA_ERR_ACTION_PERMANENT,
                 RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
 
-                /** should be RD_KAFKA_ERR_ACTION_RETRY when configured to be retryable */
-                RD_KAFKA_ERR_ACTION_PERMANENT,
+                rkb->rkb_rk->rk_conf.retry_authorization_failed ?
+                        RD_KAFKA_ERR_ACTION_RETRY :
+                        RD_KAFKA_ERR_ACTION_PERMANENT,
                 RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
 
 
@@ -2806,8 +2810,9 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                 RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED,
                 RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART,
 
-                RD_KAFKA_ERR_ACTION_PERMANENT|
-                RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED,
+                rkb->rkb_rk->rk_conf.retry_authorization_failed ?
+                        RD_KAFKA_ERR_ACTION_RETRY :
+                        RD_KAFKA_ERR_ACTION_PERMANENT|RD_KAFKA_ERR_ACTION_MSG_NOT_PERSISTED,
                 RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
 
                 RD_KAFKA_ERR_ACTION_REFRESH|
@@ -3088,7 +3093,7 @@ static int rd_kafka_handle_Produce_error (rd_kafka_broker_t *rkb,
                 perr->err = RD_KAFKA_RESP_ERR__MSG_TIMED_OUT;
 
         } else if (perr->err == RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED &&
-                   !rk->rk_conf.retry_topic_authorization_failed) {
+                   !rk->rk_conf.retry_authorization_failed) {
                 /* If we're no longer authorized to access the topic mark
                  * it as errored to deny further produce requests. */
                 rd_kafka_topic_wrlock(rktp->rktp_rkt);

@@ -4174,7 +4174,6 @@ static void rd_kafka_fetch_reply_handle_partition_error (
         }
         break;
 
-        /** Shall we not do this when retryable? **/
         case RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED:
                 /* If we're not authorized to access the
                  * topic mark it as errored to deny

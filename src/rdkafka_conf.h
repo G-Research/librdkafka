@@ -384,8 +384,8 @@ struct rd_kafka_conf_s {
 	rd_ts_t buffering_max_us;    /**< This is the value used in the code */
         int    queue_backpressure_thres;
 	int    max_retries;
-    int    retry_backoff_ms;
-    rd_bool_t    retry_topic_authorization_failed;
+	int    retry_backoff_ms;
+	rd_bool_t    retry_authorization_failed;
 	int    batch_num_messages;
         int    batch_size;
 	rd_kafka_compression_t compression_codec;
