@@ -614,6 +614,11 @@ static void rd_kafka_txn_handle_AddPartitionsToTxn (rd_kafka_t *rk,
 
                         case RD_KAFKA_RESP_ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED:
                         case RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED:
+                                if (rk->rk_conf.retry_authorization_failed) {
+                                    p_actions |= RD_KAFKA_ERR_ACTION_RETRY;
+                                    break;
+                                }
+                                /* FALLTHROUGH */
                         case RD_KAFKA_RESP_ERR_INVALID_PRODUCER_ID_MAPPING:
                         case RD_KAFKA_RESP_ERR_INVALID_PRODUCER_EPOCH:
                         case RD_KAFKA_RESP_ERR_INVALID_TXN_STATE:
@@ -622,8 +627,12 @@ static void rd_kafka_txn_handle_AddPartitionsToTxn (rd_kafka_t *rk,
                                 break;
 
                         case RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED:
-                                p_actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
-                                err = ErrorCode;
+                                if (rk->rk_conf.retry_authorization_failed) {
+                                    p_actions |= RD_KAFKA_ERR_ACTION_RETRY;
+                                } else {
+                                    p_actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
+                                    err = ErrorCode;
+                                }
                                 break;
 
                         case RD_KAFKA_RESP_ERR_OPERATION_NOT_ATTEMPTED:
@@ -631,6 +640,13 @@ static void rd_kafka_txn_handle_AddPartitionsToTxn (rd_kafka_t *rk,
                                  * errors */
                                 break;
 
+                        case RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED:
+                        case RD_KAFKA_RESP_ERR_DELEGATION_TOKEN_AUTHORIZATION_FAILED:
+                                if (rk->rk_conf.retry_authorization_failed) {
+                                    p_actions |= RD_KAFKA_ERR_ACTION_RETRY;
+                                    break;
+                                }
+                                /* FALLTHROUGH */
                         default:
                                 /* Unhandled error, fail transaction */
                                 p_actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
@@ -1462,6 +1478,11 @@ static void rd_kafka_txn_handle_TxnOffsetCommit (rd_kafka_t *rk,
 
         case RD_KAFKA_RESP_ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED:
         case RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED:
+                if (rk->rk_conf.retry_authorization_failed) {
+                    actions |= RD_KAFKA_ERR_ACTION_RETRY;
+                    break;
+                }
+                /* FALLTHROUGH */
         case RD_KAFKA_RESP_ERR_INVALID_PRODUCER_ID_MAPPING:
         case RD_KAFKA_RESP_ERR_INVALID_PRODUCER_EPOCH:
         case RD_KAFKA_RESP_ERR_INVALID_TXN_STATE:
@@ -1471,9 +1492,12 @@ static void rd_kafka_txn_handle_TxnOffsetCommit (rd_kafka_t *rk,
 
         case RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED:
         case RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED:
-                actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
-                break;
-
+        case RD_KAFKA_RESP_ERR_DELEGATION_TOKEN_AUTHORIZATION_FAILED:
+                if (rk->rk_conf.retry_authorization_failed) {
+                    actions |= RD_KAFKA_ERR_ACTION_RETRY;
+                    break;
+                }
+                /* FALLTHROUGH */
         default:
                 /* Unhandled error, fail transaction */
                 actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
@@ -1674,6 +1698,11 @@ static void rd_kafka_txn_handle_AddOffsetsToTxn (rd_kafka_t *rk,
 
         case RD_KAFKA_RESP_ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED:
         case RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED:
+                if (rk->rk_conf.retry_authorization_failed) {
+                    actions |= RD_KAFKA_ERR_ACTION_RETRY;
+                    break;
+                }
+                /* FALLTHROUGH */
         case RD_KAFKA_RESP_ERR_INVALID_PRODUCER_EPOCH:
         case RD_KAFKA_RESP_ERR_INVALID_TXN_STATE:
         case RD_KAFKA_RESP_ERR_UNSUPPORTED_FOR_MESSAGE_FORMAT:
@@ -1682,7 +1711,11 @@ static void rd_kafka_txn_handle_AddOffsetsToTxn (rd_kafka_t *rk,
 
         case RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED:
         case RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED:
-                actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
+        case RD_KAFKA_RESP_ERR_DELEGATION_TOKEN_AUTHORIZATION_FAILED:
+                if (rk->rk_conf.retry_authorization_failed)
+                    actions |= RD_KAFKA_ERR_ACTION_RETRY;
+                else
+                    actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
                 break;
 
         case RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART:
@@ -1996,6 +2029,14 @@ static void rd_kafka_txn_handle_EndTxn (rd_kafka_t *rk,
                 actions |= RD_KAFKA_ERR_ACTION_FATAL;
                 break;
 
+        case RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED:
+        case RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED:
+        case RD_KAFKA_RESP_ERR_DELEGATION_TOKEN_AUTHORIZATION_FAILED:
+                if (rk->rk_conf.retry_authorization_failed) {
+                    actions |= RD_KAFKA_ERR_ACTION_RETRY;
+                    break;
+                }
+                /* FALLTHROUGH */
         default:
                 /* All unhandled errors are permanent */
                 actions |= RD_KAFKA_ERR_ACTION_PERMANENT;
@@ -2527,6 +2568,7 @@ rd_kafka_txn_handle_FindCoordinator (rd_kafka_t *rk,
         case RD_KAFKA_RESP_ERR__DESTROY:
                 return;
 
+        /** what shall we do here with other authorization failures? */
         case RD_KAFKA_RESP_ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED:
         case RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED:
                 rd_kafka_wrlock(rk);
