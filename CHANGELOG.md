@@ -1,3 +1,10 @@
+# librdkafka v2.8.0 + gr
+ - https://github.com/confluentinc/librdkafka/pull/4864 (Remove the entry with old id from the cache)
+ - https://github.com/confluentinc/librdkafka/pull/4905 (Metadata propagation should also work for existing topics)
+ - https://github.com/confluentinc/librdkafka/pull/4972 (Avoid unnecessary producer epoch bumps)
+ - https://github.com/confluentinc/librdkafka/pull/4989 (Fully utilize the max.in.flight.requests.per.connection parameter on the idempotent producer)
+ 
+ 
 # librdkafka v2.8.0
 
 librdkafka v2.8.0 is a maintenance release:
