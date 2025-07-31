@@ -1,3 +1,7 @@
+# librdkafka v2.11.0 + gr
+ - https://github.com/confluentinc/librdkafka/pull/4972 (Avoid unnecessary producer epoch bumps)
+ - https://github.com/confluentinc/librdkafka/pull/4989 (Fully utilize the max.in.flight.requests.per.connection parameter on the idempotent producer)
+ 
 # librdkafka v2.11.0
 
 librdkafka v2.11.0 is a feature release:
