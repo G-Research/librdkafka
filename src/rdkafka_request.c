@@ -3971,8 +3971,9 @@ rd_kafka_handle_idempotent_Produce_error(rd_kafka_broker_t *rkb,
                          * that are in-flight to have a non-sequential
                          * sequence number and thus fail.
                          * But these sub-sequent requests (R2..R5) are not at
-                         * the risk of being duplicated 
-                         * so we re-enqueue the messages for later retry (without incrementing retries).
+                         * the risk of being duplicated
+                         * so we re-enqueue the messages for later retry
+                         * (without incrementing retries).
                          */
                         rd_rkb_dbg(
                             rkb, MSG | RD_KAFKA_DBG_EOS, "ERRSEQ",

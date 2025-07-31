@@ -54,17 +54,17 @@ jobs:
           path: artifacts/
 
   style-check:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     if: "!startsWith(github.ref, 'refs/tags/v')"
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y clang-format-10 python3 python3-pip python3-setuptools
+          sudo apt install -y clang-format-18 python3 python3-pip python3-setuptools
           python3 -m pip install -r packaging/tools/requirements.txt
       - name: Style check
-        run: CLANG_FORMAT=clang-format-10 make style-check
+        run: make style-check
 
   documentation:
     runs-on: ubuntu-22.04
