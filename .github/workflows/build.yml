@@ -267,11 +267,10 @@ jobs:
         shell: pwsh
         run: |
           # Different packaging for tagged vs untagged builds
-          $vstring = "2.11.0-"
-          if ($env:GITHUB_REF -match '^refs/tags/') {
-            $vstring += "gr"
+          if ($env:GITHUB_REF -match '^refs/tags/v') {
+            $vstring = $env:GITHUB_REF -replace '^refs/tags/v', ''
           } else {
-            $vstring += "ci-$env:GITHUB_RUN_ID"
+            $vstring = "$((Get-Content .\vcpkg.json | ConvertFrom-Json).version)-ci-$($env:GITHUB_RUN_ID)"
           }
 
           mkdir packages
