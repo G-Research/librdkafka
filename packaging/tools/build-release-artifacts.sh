@@ -25,6 +25,7 @@ docker_image=""
 extra_pkgs_rpm=""
 extra_pkgs_apk=""
 extra_config_args=""
+sasl2_abi="v3"
 expected_features="gzip snappy ssl sasl regex lz4 sasl_plain sasl_scram plugins zstd sasl_oauthbearer http oidc"
 
 # Since cyrus-sasl is the only non-statically-linkable dependency,
@@ -40,6 +41,12 @@ else
     extra_pkgs_apk="${extra_pkgs_apk} cyrus-sasl cyrus-sasl-dev"
     expected_features="${expected_features} sasl_gssapi"
     disable_gssapi=""
+fi
+
+# If --sasl2-abi-v2 is specified, we build librdkafka with the v2 ABI.
+if [ "$1" = "--sasl2-abi-v2" ]; then
+    sasl2_abi="v2"
+    shift
 fi
 
 # Check if we're running on the host or the (docker) build target.
@@ -97,6 +104,10 @@ make -j
 
 # Show library linkage (for troubleshooting) and checksums (for verification)
 for lib in src/librdkafka.so.1 src-cpp/librdkafka++.so.1; do
+    if [ "$sasl2_abi" = "v2" ]; then
+        echo "$0: Patching $lib to use libsasl2.so.2"
+        patchelf --replace-needed libsasl2.so.3 libsasl2.so.2 ${lib}
+    fi
     echo "$0: LINKAGE ${lib}:"
     ldd src/librdkafka.so.1
     echo "$0: SHA256 ${lib}:"
