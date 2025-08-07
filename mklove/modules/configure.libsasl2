@@ -30,7 +30,14 @@ function manual_checks {
 #include <sasl/sasl.h>
 "
 
+    # Save the current value of LIBS so we can restore it later
+    local libs=$(mkl_mkvar_get LIBS)
+
     if ! mkl_lib_check "libsasl2" "WITH_SASL_CYRUS" $action CC "-lsasl2" "$sasl_includes" ; then
         mkl_lib_check "libsasl" "WITH_SASL_CYRUS" $action CC "-lsasl" "$sasl_includes"
     fi
+
+    # Restore the original value of LIBS as we will use dlopen() to load the library
+    # and we don't want to link against the library at compile time.
+    mkl_mkvar_set libsasl2 LIBS "$libs"
 }
