@@ -159,7 +159,7 @@ jobs:
             image: quay.io/pypa/manylinux_2_28_aarch64:2024.07.01-1
             extra_args: "--disable-gssapi"
           - name: "alpine musl +gssapi"
-            artifact_key: p-librdkafka__plat-linux__dist-alpine__arch-arm64__lnk-all__extra-gssapi
+            artifact_key: p-librdkafka__plat-linux__dist-alpine__arch-arm64__lnk-std__extra-gssapi
             image: alpine:3.16.9
             extra_args: ""
           - name: "alpine musl"
