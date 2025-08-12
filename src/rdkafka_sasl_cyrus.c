@@ -674,7 +674,8 @@ static int rd_kafka_sasl_cyrus_conf_validate(rd_kafka_t *rk,
 void *rd_kafka_sasl_cyrus_try_dlopen_any(const char *const *libnames,
                                          int count) {
         void *handle = NULL;
-        for (int i = 0; i < count; i++) {
+        int i;
+        for (i = 0; i < count; i++) {
                 handle = dlopen(libnames[i], RTLD_LAZY | RTLD_LOCAL);
                 if (handle)
                         return handle;
