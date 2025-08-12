@@ -380,8 +380,10 @@ int rd_kafka_sasl_select_provider(rd_kafka_t *rk,
                 /* GSSAPI / Kerberos */
 #ifdef _WIN32
                 provider = &rd_kafka_sasl_win32_provider;
-#elif WITH_SASL_CYRUS
-                provider = &rd_kafka_sasl_cyrus_provider;
+#elif WITH_LIBDL
+                if (rd_kafka_sasl_cyrus_is_library_loaded()) {
+                        provider = &rd_kafka_sasl_cyrus_provider;
+                }
 #endif
 
         } else if (!strcmp(rk->rk_conf.sasl.mechanisms, "PLAIN")) {
@@ -413,7 +415,8 @@ int rd_kafka_sasl_select_provider(rd_kafka_t *rk,
                             "No provider for SASL mechanism %s"
                             ": recompile librdkafka with "
 #ifndef _WIN32
-                            "libsasl2 or "
+                            "libdl support (and make sure libsasl2 is "
+                            "installed) or "
 #endif
                             "openssl support. "
                             "Current build options:"
@@ -421,8 +424,8 @@ int rd_kafka_sasl_select_provider(rd_kafka_t *rk,
 #ifdef _WIN32
                             " WindowsSSPI(GSSAPI)"
 #endif
-#if WITH_SASL_CYRUS
-                            " SASL_CYRUS"
+#if WITH_LIBDL
+                            " LIBDL"
 #endif
 #if WITH_SASL_SCRAM
                             " SASL_SCRAM"
@@ -478,7 +481,7 @@ rd_kafka_error_t *rd_kafka_sasl_background_callbacks_enable(rd_kafka_t *rk) {
  * Global SASL termination.
  */
 void rd_kafka_sasl_global_term(void) {
-#if WITH_SASL_CYRUS
+#if WITH_LIBDL
         rd_kafka_sasl_cyrus_global_term();
 #endif
 }
@@ -488,7 +491,7 @@ void rd_kafka_sasl_global_term(void) {
  * Global SASL init, called once per runtime.
  */
 int rd_kafka_sasl_global_init(void) {
-#if WITH_SASL_CYRUS
+#if WITH_LIBDL
         return rd_kafka_sasl_cyrus_global_init();
 #else
         return 0;

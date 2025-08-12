@@ -12,7 +12,6 @@ endif
 CPPFLAGS += -I.
 
 
-SRCS_$(WITH_SASL_CYRUS) += rdkafka_sasl_cyrus.c
 SRCS_$(WITH_SASL_SCRAM) += rdkafka_sasl_scram.c
 SRCS_$(WITH_SASL_OAUTHBEARER) += rdkafka_sasl_oauthbearer.c
 SRCS_$(WITH_SNAPPY) += snappy.c
@@ -30,7 +29,7 @@ SRCS_LZ4 += lz4.c lz4frame.c lz4hc.c
 endif
 SRCS_y += rdkafka_lz4.c $(SRCS_LZ4)
 
-SRCS_$(WITH_LIBDL) += rddl.c
+SRCS_$(WITH_LIBDL) += rddl.c rdkafka_sasl_cyrus.c
 SRCS_$(WITH_PLUGINS) += rdkafka_plugin.c
 
 ifneq ($(HAVE_REGEX), y)

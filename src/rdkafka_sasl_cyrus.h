@@ -41,8 +41,6 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
 
-#include <sasl/sasl.h>
-
 
 #define RESOLVE_SYM(handle, sym)                                               \
         do {                                                                   \
@@ -63,19 +61,69 @@
                 size_t count = sizeof(names) / sizeof(names[0]);                 \
                 var          = rd_kafka_sasl_cyrus_try_dlopen_any(names, count); \
                 if (!var) {                                                      \
+                        /* TODO should we log this? */                           \
+                        /*                                                       \
                         fprintf(stderr,                                          \
                                 "librdkafka: dlopen() failed for the "           \
                                 "following libraries: ");                        \
                         for (size_t i = 0; i < count; i++)                       \
                                 fprintf(stderr, "%s%s", names[i],                \
                                         i == count - 1 ? "\n" : ", ");           \
+                        */                                                       \
                         return -1;                                               \
                 }                                                                \
         } while (0)
 
 
+/* Handle for the loaded Cyrus SASL library */
 static void *rd_kafka_sasl_cyrus_library_handle = NULL;
 
+
+/* Cyrus SASL API
+ * Copied from sasl/sasl.h */
+#define SASL_CONTINUE 1
+#define SASL_OK       0
+#define SASL_FAIL     -1
+#define SASL_INTERACT 2
+
+#define SASL_CB_LIST_END     0
+#define SASL_CB_LOG          2
+#define SASL_CB_USER         0x4001
+#define SASL_CB_AUTHNAME     0x4002
+#define SASL_CB_PASS         0x4004
+#define SASL_CB_ECHOPROMPT   0x4005
+#define SASL_CB_NOECHOPROMPT 0x4006
+#define SASL_CB_GETREALM     (0x4008)
+#define SASL_CB_CANON_USER   (0x8007)
+
+#define SASL_USERNAME   0
+#define SASL_AUTHSOURCE 14
+#define SASL_MECHNAME   15
+
+typedef struct sasl_conn sasl_conn_t;
+
+typedef struct sasl_secret {
+        unsigned long len;
+        unsigned char data[1];
+} sasl_secret_t;
+
+typedef struct sasl_callback {
+        unsigned long id;
+        int (*proc)(void);
+        void *context;
+} sasl_callback_t;
+
+typedef struct sasl_interact {
+        unsigned long id;
+        const char *challenge;
+        const char *prompt;
+        const char *defresult;
+        const void *result;
+        unsigned len;
+} sasl_interact_t;
+
+
+/* Function pointers for the Cyrus SASL API */
 static int (*sasl_client_init_p)(const sasl_callback_t *)    = NULL;
 static int (*sasl_client_new_p)(const char *service,
                                 const char *serverFQDN,
@@ -112,5 +160,6 @@ static int (*sasl_listmech_p)(sasl_conn_t *conn,
                               const char **result,
                               unsigned *plen,
                               int *pcount)                   = NULL;
+
 
 #endif /* _RDKAFKA_SASL_CYRUS_H_ */

@@ -685,7 +685,7 @@ void *rd_kafka_sasl_cyrus_try_dlopen_any(const char *const *libnames,
 
 int rd_kafka_sasl_cyrus_load_library(void) {
 #ifdef __APPLE__
-        const char *const libnames[] = {"libsasl2.2.dylib", "libsasl2.3.dylib"};
+        const char *const libnames[] = {"libsasl2.2.dylib"};
 #else
         const char *const libnames[] = {"libsasl2.so.2", "libsasl2.so.3"};
 #endif
@@ -706,6 +706,28 @@ int rd_kafka_sasl_cyrus_load_library(void) {
 }
 
 
+void rd_kafka_sasl_cyrus_unload_library(void) {
+        if (rd_kafka_sasl_cyrus_library_handle != NULL) {
+                dlclose(rd_kafka_sasl_cyrus_library_handle);
+                rd_kafka_sasl_cyrus_library_handle = NULL;
+                sasl_client_init_p                 = NULL;
+                sasl_client_new_p                  = NULL;
+                sasl_client_start_p                = NULL;
+                sasl_client_step_p                 = NULL;
+                sasl_dispose_p                     = NULL;
+                sasl_errdetail_p                   = NULL;
+                sasl_errstring_p                   = NULL;
+                sasl_getprop_p                     = NULL;
+                sasl_listmech_p                    = NULL;
+        }
+}
+
+
+int rd_kafka_sasl_cyrus_is_library_loaded(void) {
+        return rd_kafka_sasl_cyrus_library_handle != NULL;
+}
+
+
 /**
  * Global SASL termination.
  */
@@ -713,6 +735,7 @@ void rd_kafka_sasl_cyrus_global_term(void) {
         /* NOTE: Should not be called since the application may be using SASL
          * too*/
         /* sasl_done(); */
+        rd_kafka_sasl_cyrus_unload_library();
         mtx_destroy(&rd_kafka_sasl_cyrus_kinit_lock);
 }
 
@@ -726,8 +749,11 @@ int rd_kafka_sasl_cyrus_global_init(void) {
         mtx_init(&rd_kafka_sasl_cyrus_kinit_lock, mtx_plain);
 
         if (rd_kafka_sasl_cyrus_load_library() < 0) {
+                /* TODO should we log this? */
+                /*
                 fprintf(stderr,
                         "librdkafka: failed to load Cyrus SASL library\n");
+                */
                 return -1;
         }
 

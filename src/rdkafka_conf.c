@@ -222,11 +222,13 @@ struct rd_kafka_property {
 #define _UNSUPPORTED_WIN32_GSSAPI .unsupported = NULL
 #endif
 
-#if defined(_WIN32) || defined(WITH_SASL_CYRUS)
+#if defined(_WIN32) || defined(WITH_LIBDL)
 #define _UNSUPPORTED_GSSAPI .unsupported = NULL
 #else
 #define _UNSUPPORTED_GSSAPI                                                    \
-        .unsupported = "cyrus-sasl/libsasl2 not available at build time"
+        .unsupported =                                                         \
+            "Dynamic library loading not supported on this "                   \
+            "platform"
 #endif
 
 #define _UNSUPPORTED_OAUTHBEARER _UNSUPPORTED_SSL
