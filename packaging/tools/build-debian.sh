@@ -48,7 +48,7 @@ git config --global --add safe.directory /v
 
 (cd $LRK_DIR ; git archive --format tar HEAD) | tar xf -
 
-./configure --install-deps --disable-gssapi --disable-lz4-ext --enable-static --prefix=$DEST_DIR $CONFIG_ARGS
+./configure --install-deps --disable-lz4-ext --enable-static --prefix=$DEST_DIR $CONFIG_ARGS
 make -j
 examples/rdkafka_example -X builtin.features
 CI=true make -C tests run_local_quick
