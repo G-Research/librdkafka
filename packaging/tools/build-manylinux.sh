@@ -7,7 +7,6 @@
 #
 # Statically linked
 # WITH openssl 1.1.1, zlib, lz4(bundled)
-# WITHOUT libsasl2
 #
 #
 # Run:
