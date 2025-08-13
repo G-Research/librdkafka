@@ -33,7 +33,12 @@
 #include "rdkafka_sasl.h"
 #include "rdkafka_sasl_int.h"
 #include "rdstring.h"
-#include "rdkafka_sasl_cyrus.h"
+#include "rdkafka_sasl_cyrus_int.h"
+
+#if defined(__FreeBSD__) || defined(__OpenBSD__)
+#include <sys/wait.h> /* For WIF.. */
+#endif
+
 
 /**
  * @brief Process-global lock to avoid simultaneous invocation of
@@ -672,19 +677,16 @@ static int rd_kafka_sasl_cyrus_conf_validate(rd_kafka_t *rk,
 
 
 int rd_kafka_sasl_cyrus_load_library(void) {
-#ifdef __APPLE__
-        const char *const libnames[] = {"libsasl2.2.dylib"};
-#else
-        const char *const libnames[] = {"libsasl2.so.2", "libsasl2.so.3"};
-#endif
-        size_t count = sizeof(libnames) / sizeof(libnames[0]);
+        size_t count = sizeof(rd_kafka_sasl_cyrus_library_names) /
+                       sizeof(rd_kafka_sasl_cyrus_library_names[0]);
         char *errstrs[count];
 
         size_t i;
         for (i = 0; i < count; i++) {
                 char errstr[512];
                 rd_kafka_sasl_cyrus_library_handle =
-                    rd_dl_open(libnames[i], errstr, sizeof(errstr));
+                    rd_dl_open(rd_kafka_sasl_cyrus_library_names[i], errstr,
+                               sizeof(errstr));
                 if (rd_kafka_sasl_cyrus_library_handle)
                         break;
                 errstrs[i] = rd_strdup(errstr);

@@ -31,35 +31,24 @@
 
 #include "rddl.h"
 
-#if defined(__FreeBSD__) || defined(__OpenBSD__)
-#include <sys/wait.h> /* For WIF.. */
+#ifdef __APPLE__
+const char *const rd_kafka_sasl_cyrus_library_names[] = {"libsasl2.2.dylib"};
+#else
+const char *const rd_kafka_sasl_cyrus_library_names[] = {"libsasl2.so.2",
+                                                         "libsasl2.so.3"};
 #endif
-
-
-#define RESOLVE_SYM(handle, sym)                                               \
-        do {                                                                   \
-                sym##_p = rd_dl_sym(                                           \
-                    (handle), #sym, rd_kafka_sasl_cyrus_library_errstr,        \
-                    sizeof(rd_kafka_sasl_cyrus_library_errstr));               \
-                if (!(sym##_p)) {                                              \
-                        rd_dl_close(handle);                                   \
-                        (handle) = NULL;                                       \
-                        return -1;                                             \
-                }                                                              \
-        } while (0)
-
-
 
 /* Handle for the loaded Cyrus SASL library */
 static rd_dl_hnd_t *rd_kafka_sasl_cyrus_library_handle = NULL;
-
 
 /* Global loading error string */
 static char rd_kafka_sasl_cyrus_library_errstr[1024];
 
 
 /* Cyrus SASL API
- * Copied from sasl/sasl.h */
+ * Copied from sasl/sasl.h.
+ * These are only the symbols we use, not the full API.
+ */
 #define SASL_CONTINUE 1
 #define SASL_OK       0
 #define SASL_FAIL     -1
@@ -139,6 +128,20 @@ static int (*sasl_listmech_p)(sasl_conn_t *conn,
                               const char **result,
                               unsigned *plen,
                               int *pcount)                   = NULL;
+
+
+/* Resolve a symbol from the Cyrus SASL library */
+#define RESOLVE_SYM(handle, sym)                                               \
+        do {                                                                   \
+                sym##_p = rd_dl_sym(                                           \
+                    (handle), #sym, rd_kafka_sasl_cyrus_library_errstr,        \
+                    sizeof(rd_kafka_sasl_cyrus_library_errstr));               \
+                if (!(sym##_p)) {                                              \
+                        rd_dl_close(handle);                                   \
+                        (handle) = NULL;                                       \
+                        return -1;                                             \
+                }                                                              \
+        } while (0)
 
 
 #endif /* _RDKAFKA_SASL_CYRUS_H_ */
