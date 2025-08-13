@@ -671,27 +671,36 @@ static int rd_kafka_sasl_cyrus_conf_validate(rd_kafka_t *rk,
 }
 
 
-void *rd_kafka_sasl_cyrus_try_dlopen_any(const char *const *libnames,
-                                         int count) {
-        void *handle = NULL;
-        int i;
-        for (i = 0; i < count; i++) {
-                handle = dlopen(libnames[i], RTLD_LAZY | RTLD_LOCAL);
-                if (handle)
-                        return handle;
-        }
-        return NULL;
-}
-
-
 int rd_kafka_sasl_cyrus_load_library(void) {
 #ifdef __APPLE__
         const char *const libnames[] = {"libsasl2.2.dylib"};
 #else
         const char *const libnames[] = {"libsasl2.so.2", "libsasl2.so.3"};
 #endif
+        size_t count = sizeof(libnames) / sizeof(libnames[0]);
+        char *errstrs[count];
 
-        TRY_DLOPEN_LIST(rd_kafka_sasl_cyrus_library_handle, libnames);
+        size_t i;
+        for (i = 0; i < count; i++) {
+                char errstr[512];
+                rd_kafka_sasl_cyrus_library_handle =
+                    rd_dl_open(libnames[i], errstr, sizeof(errstr));
+                if (rd_kafka_sasl_cyrus_library_handle)
+                        break;
+                errstrs[i] = rd_strdup(errstr);
+        }
+
+        if (!rd_kafka_sasl_cyrus_library_handle) {
+                size_t offset = 0;
+                for (i = 0; i < count; i++) {
+                        offset += rd_snprintf(
+                            rd_kafka_sasl_cyrus_library_errstr + offset,
+                            sizeof(rd_kafka_sasl_cyrus_library_errstr) - offset,
+                            "%s%s", errstrs[i], (i < count - 1) ? "; " : "");
+                        rd_free(errstrs[i]);
+                }
+                return -1;
+        }
 
         RESOLVE_SYM(rd_kafka_sasl_cyrus_library_handle, sasl_client_init);
         RESOLVE_SYM(rd_kafka_sasl_cyrus_library_handle, sasl_client_new);
@@ -709,7 +718,7 @@ int rd_kafka_sasl_cyrus_load_library(void) {
 
 void rd_kafka_sasl_cyrus_unload_library(void) {
         if (rd_kafka_sasl_cyrus_library_handle != NULL) {
-                dlclose(rd_kafka_sasl_cyrus_library_handle);
+                rd_dl_close(rd_kafka_sasl_cyrus_library_handle);
                 rd_kafka_sasl_cyrus_library_handle = NULL;
                 sasl_client_init_p                 = NULL;
                 sasl_client_new_p                  = NULL;
@@ -726,6 +735,11 @@ void rd_kafka_sasl_cyrus_unload_library(void) {
 
 int rd_kafka_sasl_cyrus_is_library_loaded(void) {
         return rd_kafka_sasl_cyrus_library_handle != NULL;
+}
+
+
+char *rd_kafka_sasl_cyrus_get_library_loading_error(void) {
+        return rd_kafka_sasl_cyrus_library_errstr;
 }
 
 
@@ -750,11 +764,6 @@ int rd_kafka_sasl_cyrus_global_init(void) {
         mtx_init(&rd_kafka_sasl_cyrus_kinit_lock, mtx_plain);
 
         if (rd_kafka_sasl_cyrus_load_library() < 0) {
-                /* TODO should we log this? */
-                /*
-                fprintf(stderr,
-                        "librdkafka: failed to load Cyrus SASL library\n");
-                */
                 return -1;
         }
 

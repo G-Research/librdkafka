@@ -226,9 +226,7 @@ struct rd_kafka_property {
 #define _UNSUPPORTED_GSSAPI .unsupported = NULL
 #else
 #define _UNSUPPORTED_GSSAPI                                                    \
-        .unsupported =                                                         \
-            "Dynamic library loading not supported on this "                   \
-            "platform"
+        .unsupported = "libdl / dlopen(3) not available at build time"
 #endif
 
 #define _UNSUPPORTED_OAUTHBEARER _UNSUPPORTED_SSL

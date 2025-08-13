@@ -29,54 +29,33 @@
 #ifndef _RDKAFKA_SASL_CYRUS_H_
 #define _RDKAFKA_SASL_CYRUS_H_
 
-#include <dlfcn.h>
+#include "rddl.h"
 
 #if defined(__FreeBSD__) || defined(__OpenBSD__)
 #include <sys/wait.h> /* For WIF.. */
 #endif
 
-#ifdef __APPLE__
-/* Apple has deprecated most of the SASL API for unknown reason,
- * silence those warnings. */
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-#endif
-
 
 #define RESOLVE_SYM(handle, sym)                                               \
         do {                                                                   \
-                sym##_p = dlsym((handle), #sym);                               \
+                sym##_p = rd_dl_sym(                                           \
+                    (handle), #sym, rd_kafka_sasl_cyrus_library_errstr,        \
+                    sizeof(rd_kafka_sasl_cyrus_library_errstr));               \
                 if (!(sym##_p)) {                                              \
-                        fprintf(stderr,                                        \
-                                "librdkafka: dlsym(\"%s\") failed: %s\n",      \
-                                #sym, dlerror());                              \
-                        dlclose(handle);                                       \
+                        rd_dl_close(handle);                                   \
                         (handle) = NULL;                                       \
                         return -1;                                             \
                 }                                                              \
         } while (0)
 
 
-#define TRY_DLOPEN_LIST(var, names)                                              \
-        do {                                                                     \
-                size_t count = sizeof(names) / sizeof(names[0]);                 \
-                var          = rd_kafka_sasl_cyrus_try_dlopen_any(names, count); \
-                if (!var) {                                                      \
-                        /* TODO should we log this? */                           \
-                        /*                                                       \
-                        fprintf(stderr,                                          \
-                                "librdkafka: dlopen() failed for the "           \
-                                "following libraries: ");                        \
-                        for (size_t i = 0; i < count; i++)                       \
-                                fprintf(stderr, "%s%s", names[i],                \
-                                        i == count - 1 ? "\n" : ", ");           \
-                        */                                                       \
-                        return -1;                                               \
-                }                                                                \
-        } while (0)
-
 
 /* Handle for the loaded Cyrus SASL library */
-static void *rd_kafka_sasl_cyrus_library_handle = NULL;
+static rd_dl_hnd_t *rd_kafka_sasl_cyrus_library_handle = NULL;
+
+
+/* Global loading error string */
+static char rd_kafka_sasl_cyrus_library_errstr[1024];
 
 
 /* Cyrus SASL API
