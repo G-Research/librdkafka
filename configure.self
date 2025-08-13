@@ -98,6 +98,7 @@ void foo (void) {
 
     if [[ $WITH_LIBDL == "y" ]]; then
         mkl_allvar_set WITH_PLUGINS WITH_PLUGINS y
+        mkl_allvar_set WITH_SASL_CYRUS WITH_SASL_CYRUS y
     fi
 
     # optional libs

@@ -63,7 +63,7 @@ struct rd_kafka_sasl_provider {
 extern const struct rd_kafka_sasl_provider rd_kafka_sasl_win32_provider;
 #endif
 
-#if WITH_LIBDL
+#if WITH_SASL_CYRUS
 extern const struct rd_kafka_sasl_provider rd_kafka_sasl_cyrus_provider;
 void rd_kafka_sasl_cyrus_global_term(void);
 int rd_kafka_sasl_cyrus_global_init(void);

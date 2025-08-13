@@ -101,7 +101,7 @@ endif()
 
 if(WIN32)
   list(APPEND sources rdkafka_sasl_win32.c)
-elseif(WITH_LIBDL)
+elseif(WITH_SASL_CYRUS)
   list(APPEND sources rdkafka_sasl_cyrus.c)
 endif()
 
