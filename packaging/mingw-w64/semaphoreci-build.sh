@@ -26,7 +26,7 @@ else
 fi
 
 
-# ./packaging/mingw-w64/run-tests.sh
+./packaging/mingw-w64/run-tests.sh
 
 pushd dest
 tar cvzf $archive .
