@@ -117,28 +117,18 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: "centos8 glibc +gssapi"
-            artifact_key: p-librdkafka__plat-linux__dist-centos8__arch-x64__lnk-std__extra-gssapi
-            image: quay.io/pypa/manylinux_2_28_x86_64:2024.07.01-1
-            extra_args: ""
           - name: "centos8 glibc"
             artifact_key: p-librdkafka__plat-linux__dist-centos8__arch-x64__lnk-all
             image: quay.io/pypa/manylinux_2_28_x86_64:2024.07.01-1
-            extra_args: "--disable-gssapi"
-          - name: "alpine musl +gssapi"
-            artifact_key: p-librdkafka__plat-linux__dist-alpine__arch-x64__lnk-std__extra-gssapi
-            image: alpine:3.16.9
-            extra_args: ""
           - name: "alpine musl"
             artifact_key: p-librdkafka__plat-linux__dist-alpine__arch-x64__lnk-all
             image: alpine:3.16.9
-            extra_args: "--disable-gssapi"
     steps:
       - uses: actions/checkout@v4
       - name: Build
         run: |
           mkdir artifacts
-          packaging/tools/build-release-artifacts.sh ${{ matrix.extra_args }} ${{ matrix.image }} artifacts/librdkafka.tgz
+          packaging/tools/build-release-artifacts.sh ${{ matrix.image }} artifacts/librdkafka.tgz
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -150,28 +140,18 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: "centos8 glibc +gssapi"
-            artifact_key: p-librdkafka__plat-linux__dist-centos8__arch-arm64__lnk-std__extra-gssapi
-            image: quay.io/pypa/manylinux_2_28_aarch64:2024.07.01-1
-            extra_args: ""
           - name: "centos8 glibc"
             artifact_key: p-librdkafka__plat-linux__dist-centos8__arch-arm64__lnk-all
             image: quay.io/pypa/manylinux_2_28_aarch64:2024.07.01-1
-            extra_args: "--disable-gssapi"
-          - name: "alpine musl +gssapi"
-            artifact_key: p-librdkafka__plat-linux__dist-alpine__arch-arm64__lnk-all__extra-gssapi
-            image: alpine:3.16.9
-            extra_args: ""
           - name: "alpine musl"
             artifact_key: p-librdkafka__plat-linux__dist-alpine__arch-arm64__lnk-all
             image: alpine:3.16.9
-            extra_args: "--disable-gssapi"
     steps:
       - uses: actions/checkout@v4
       - name: Build
         run: |
           mkdir artifacts
-          packaging/tools/build-release-artifacts.sh ${{ matrix.extra_args }} ${{ matrix.image }} artifacts/librdkafka.tgz
+          packaging/tools/build-release-artifacts.sh ${{ matrix.image }} artifacts/librdkafka.tgz
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
