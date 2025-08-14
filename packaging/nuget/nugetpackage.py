@@ -230,9 +230,11 @@ class NugetPackage (Package):
         """ Build single NuGet package for all its artifacts. """
 
         # NuGet removes the prefixing v from the version.
+        # And also strips any +build metadata.
         vless_version = self.kv['version']
         if vless_version[0] == 'v':
             vless_version = vless_version[1:]
+        vless_version = vless_version.split('+')[0]
 
         self.stpath = tempfile.mkdtemp(prefix="out-", suffix="-%s" % buildtype,
                                        dir=".")
