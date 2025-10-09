@@ -1,3 +1,8 @@
+# librdkafka v2.12.0.1+gr
+ - https://github.com/confluentinc/librdkafka/pull/4972 (Avoid unnecessary producer epoch bumps)
+ - https://github.com/confluentinc/librdkafka/pull/4989 (Fully utilize the max.in.flight.requests.per.connection parameter on the idempotent producer)
+ - https://github.com/confluentinc/librdkafka/pull/5168 (Use system-provided cyrus-sasl/libsasl2 at runtime)
+
 # librdkafka v2.12.0
 
 librdkafka v2.12.0 is a feature release:

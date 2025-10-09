@@ -1,0 +1,290 @@
+name: librdkafka build and release artifact pipeline
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  osx-arm64:
+    runs-on: macos-15
+    env:
+      ARTIFACT_KEY: p-librdkafka__plat-osx__arch-arm64__lnk-all
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          mkdir artifacts dest
+          ./configure --install-deps --source-deps-only --enable-static --disable-lz4-ext --enable-strip
+          make -j all examples check
+          examples/rdkafka_example -X builtin.features
+          otool -L src/librdkafka.dylib
+          otool -L src-cpp/librdkafka++.dylib
+          make -j -C tests build
+          make -C tests run_local_quick
+          DESTDIR="$PWD/dest" make install
+          (cd dest && tar cvzf ../artifacts/librdkafka.tgz .)
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_KEY }}
+          path: artifacts/
+
+  osx-x64:
+    runs-on: macos-15-intel
+    env:
+      ARTIFACT_KEY: p-librdkafka__plat-osx__arch-x64__lnk-all
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          mkdir artifacts dest
+          ./configure --install-deps --source-deps-only --enable-static --disable-lz4-ext --enable-strip
+          make -j all examples check
+          examples/rdkafka_example -X builtin.features
+          otool -L src/librdkafka.dylib
+          otool -L src-cpp/librdkafka++.dylib
+          make -j -C tests build
+          make -C tests run_local_quick
+          DESTDIR="$PWD/dest" make install
+          (cd dest && tar cvzf ../artifacts/librdkafka.tgz .)
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_KEY }}
+          path: artifacts/
+
+  style-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y clang-format-18 python3 python3-pip python3-setuptools
+          python3 -m pip install -r packaging/tools/requirements.txt
+      - name: Style check
+        run: make style-check
+
+  documentation:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt install -y doxygen graphviz
+      - name: Generate documentation
+        run: |
+          mkdir artifacts
+          make docs
+          (cd staging-docs && tar cvzf ../artifacts/librdkafka-docs.tgz .)
+      - name: Upload documentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: librdkafka-docs
+          path: artifacts/librdkafka-docs.tgz
+
+  linux-ubuntu-source:
+    runs-on: ubuntu-22.04
+    env:
+      CFLAGS: -std=gnu90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build configuration checks
+        run: |
+          sudo apt install -y rapidjson-dev
+          python3 -m pip install -U pip
+          ./packaging/tools/build-configurations-checks.sh
+      - name: Build and test
+        run: |
+          python3 -m pip -V
+          (cd tests && python3 -m pip install -r requirements.txt)
+          ./configure --install-deps
+          ./packaging/tools/rdutcoverage.sh
+          make copyright-check
+          make -j all examples check
+          echo "Verifying that CONFIGURATION.md does not have manual changes"
+          git diff --exit-code CONFIGURATION.md
+          examples/rdkafka_example -X builtin.features
+          ldd src/librdkafka.so.1
+          ldd src-cpp/librdkafka++.so.1
+          make -j -C tests build
+          make -C tests run_local_quick
+          DESTDIR="$PWD/dest" make install
+          (cd tests && python3 -m trivup.clusters.KafkaCluster --version 3.4.0 --cmd "PATH=\"$PATH\" make quick")
+
+  linux-x64-release:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - name: "centos8 glibc"
+            artifact_key: p-librdkafka__plat-linux__dist-centos8__arch-x64__lnk-all
+            image: quay.io/pypa/manylinux_2_28_x86_64:2024.07.01-1
+          - name: "alpine musl"
+            artifact_key: p-librdkafka__plat-linux__dist-alpine__arch-x64__lnk-all
+            image: alpine:3.16.9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          mkdir artifacts
+          packaging/tools/build-release-artifacts.sh ${{ matrix.image }} artifacts/librdkafka.tgz
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_key }}
+          path: artifacts/
+
+  linux-arm64-release:
+    runs-on: ubuntu-22.04-arm
+    strategy:
+      matrix:
+        include:
+          - name: "centos8 glibc"
+            artifact_key: p-librdkafka__plat-linux__dist-centos8__arch-arm64__lnk-all
+            image: quay.io/pypa/manylinux_2_28_aarch64:2024.07.01-1
+          - name: "alpine musl"
+            artifact_key: p-librdkafka__plat-linux__dist-alpine__arch-arm64__lnk-all
+            image: alpine:3.16.9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          mkdir artifacts
+          packaging/tools/build-release-artifacts.sh ${{ matrix.image }} artifacts/librdkafka.tgz
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_key }}
+          path: artifacts/
+
+  windows-mingw:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - name: "MinGW-w64 Dynamic"
+            artifact_key: p-librdkafka__plat-windows__dist-mingw__arch-x64__lnk-std
+            extra_args: ""
+          - name: "MinGW-w64 Static"
+            artifact_key: p-librdkafka__plat-windows__dist-mingw__arch-x64__lnk-static
+            extra_args: "--static"
+    env:
+      CHERE_INVOKING: yes
+      MSYSTEM: UCRT64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-lz4
+            mingw-w64-x86_64-zstd
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          mkdir artifacts
+          ./packaging/mingw-w64/semaphoreci-build.sh ${{ matrix.extra_args }} ./artifacts/librdkafka.tgz
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_key }}
+          path: artifacts/
+
+  windows-msvc:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - platform: x64
+            triplet: x64-windows
+            artifact_key: p-librdkafka__plat-windows__dist-msvc__arch-x64__lnk-std
+          - platform: Win32
+            triplet: x86-windows
+            artifact_key: p-librdkafka__plat-windows__dist-msvc__arch-x86__lnk-std
+    env:
+      VCPKG_DISABLE_METRICS: yes
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup vcpkg
+        run: |
+          cd ..
+          & .\librdkafka\win32\setup-vcpkg.ps1
+          cd librdkafka
+          ..\vcpkg\vcpkg integrate install
+          ..\vcpkg\vcpkg --feature-flags=versions install --triplet ${{ matrix.triplet }}
+      - name: Build
+        run: |
+          & .\win32\msbuild.ps1 -platform ${{ matrix.platform }}
+          & .\win32\package-zip.ps1 -platform ${{ matrix.platform }}
+      - name: List artifacts
+        run: |
+          Get-ChildItem . -include *.dll -recurse
+          Get-ChildItem . -include *.lib -recurse
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_key }}
+          path: artifacts/
+
+  packaging:
+    needs: [documentation, osx-arm64, osx-x64, linux-x64-release, linux-arm64-release, windows-mingw, windows-msvc]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Build packages
+        shell: pwsh
+        run: |
+          # Different packaging for tagged vs untagged builds
+          if ($env:GITHUB_REF -match '^refs/tags/v') {
+            $vstring = $env:GITHUB_REF -replace '^refs/tags/v', ''
+          } else {
+            $vstring = "$((Get-Content .\vcpkg.json | ConvertFrom-Json).version)-ci-$($env:GITHUB_RUN_ID)"
+          }
+
+          mkdir packages
+          cd packaging/nuget
+          python3 -m pip install -U -r requirements.txt
+          ./release.py --directory ../../artifacts --ignore-tag --class NugetPackage $vstring --nuget-version $vstring
+          cp -v librdkafka.redist.*.nupkg ../../packages
+          ./release.py --directory ../../artifacts --ignore-tag --class StaticPackage $vstring
+          cp -v librdkafka-static-bundle*.tgz ../../packages
+          cd ../../
+          cp -v artifacts/librdkafka-docs/librdkafka-docs.tgz packages/
+          cd packages
+          ls -la
+          sha256sum *
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: librdkafka-artifacts
+          path: packages/
+
+  # Publish NuGet packages when a tag is pushed.
+  # Tests need to succeed for all components and on all platforms first,
+  # including having a tag name that matches the version number.
+  publish-release:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: packaging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download NuGet package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: librdkafka-artifacts
+          path: dist
+      - name: Publish to NuGet
+        run: |
+          ls -al dist
+          dotnet nuget push "dist/librdkafka*.nupkg" --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --api-key ${GITHUB_TOKEN}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
