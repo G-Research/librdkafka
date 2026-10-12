@@ -1,4 +1,4 @@
-FROM quay.io/pypa/manylinux_2_28_x86_64:2024.07.01-1
+FROM quay.io/pypa/manylinux_2_28_x86_64:2026.05.07-2
 
 ARG UID
 
