@@ -25,7 +25,7 @@ cd /home/user/librdkafka
 # Disable all flags to make sure it
 # compiles correctly in all cases
 if [ "$build_tool" = "make" ]; then
-./configure --disable-ssl --disable-gssapi \
+./configure --disable-ssl \
 --disable-curl --disable-zlib \
 --disable-zstd --disable-lz4-ext --disable-regex-ext \
 --disable-c11threads --disable-syslog \
